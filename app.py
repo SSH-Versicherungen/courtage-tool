@@ -141,6 +141,12 @@ uploaded_betreuer_file = st.file_uploader(
     "zu und markiert die Kundenzeilen farbig (Rot/Gelb/Blau)",
     type=["xlsx"],
 )
+if uploaded_betreuer_file is None:
+    st.caption(
+        "⚠️ Ohne Betreuer.xlsx bleiben Excel und PDF-Uebersicht **ohne** "
+        "Betreuer-Zuordnung/Farbmarkierung - die Datei muss bei jeder "
+        "Nutzung hier erneut hochgeladen werden."
+    )
 
 make_pdf_summary = st.checkbox(
     "PDF-Uebersicht zusaetzlich erstellen (Versicherer nach Umsatz sortiert, "
