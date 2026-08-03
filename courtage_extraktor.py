@@ -1338,6 +1338,215 @@ def insurer_bank_family(insurer_key):
     return key_norm
 
 
+# ---------------------------------------------------------------------------
+# Kunde -> Betreuer-Zuordnung (CRM-Export "Betreuer.xlsx")
+# ---------------------------------------------------------------------------
+
+# Andreas Selle hat selbst keinen CRM-Account - seine Kunden werden dort
+# unter "Calvin Keinarth" gefuehrt (Nutzer-Angabe). Umsatz wird trotzdem
+# Andreas Selle zugerechnet, nicht Calvin.
+BETREUER_ALIASES = {"calvin keinarth": "Andreas Selle"}
+PARTNER_NAMES = ["Robin Heckmann", "Tim Selle", "Andreas Selle"]
+# Farbcodes je Partner fuer die farbige Markierung in Excel/PDF (Nutzer-
+# Vorgabe: Rot=RH, Gelb=TS, Blau=AS).
+PARTNER_COLORS_XLSX = {
+    "Robin Heckmann": "FFC7CE",
+    "Tim Selle": "FFEB9C",
+    "Andreas Selle": "BDD7EE",
+}
+PARTNER_COLORS_PDF = {
+    "Robin Heckmann": (200, 30, 30),
+    "Tim Selle": (170, 140, 0),
+    "Andreas Selle": (30, 80, 170),
+}
+# Kraeftigere Variante nur fuer die kleinen Legenden-Farbkaestchen (dort
+# spielt Lesbarkeit von Text keine Rolle, ein sattes Gelb ist als "Gelb"
+# aber deutlich eindeutiger erkennbar als das gedeckte PARTNER_COLORS_PDF-Gelb,
+# das auf weissem Hintergrund lesbar bleiben muss).
+PARTNER_SWATCH_COLORS_PDF = {
+    "Robin Heckmann": (230, 50, 50),
+    "Tim Selle": (255, 200, 0),
+    "Andreas Selle": (50, 110, 220),
+}
+
+GEB_RE = re.compile(r"\(geb\.?[^)]*\)|\bgeb\.?:?\s.*$", re.IGNORECASE)
+LEGAL_FORM_SUFFIXES = ["gmbhcokg", "gmbh", "cokg", "ug", "ev", "ag", "se", "kg", "ohg", "gbr"]
+
+
+def _strip_geb(s):
+    """Entfernt Geburtsname-Zusaetze wie '(geb. Bock)' oder 'geb.: Pleli'
+    aus einem CRM-Namen, damit z.B. 'Dorn (geb. Bock)' auf 'Dorn' passt."""
+    if not s:
+        return s
+    return GEB_RE.sub("", str(s)).strip()
+
+
+def _strip_legal_form(s):
+    for suf in LEGAL_FORM_SUFFIXES:
+        if s.endswith(suf) and len(s) > len(suf):
+            return s[: -len(suf)]
+    return s
+
+
+def _levenshtein_le1(a, b):
+    """True, wenn a und b sich in hoechstens einem Zeichen unterscheiden
+    (Einfuegen/Loeschen/Ersetzen) - fuer sehr enge Tippfehler-Varianten wie
+    'Philip'/'Phillip'. Bewusst kein allgemeiner Fuzzy-Match (Risiko, zwei
+    verschiedene Personen zu verwechseln), siehe _names_match()."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if a == b:
+        return True
+    # gleiche Laenge: genau ein ersetztes Zeichen erlaubt
+    if len(a) == len(b):
+        diffs = sum(1 for x, y in zip(a, b) if x != y)
+        return diffs <= 1
+    # Laengendifferenz 1: ein eingefuegtes/geloeschtes Zeichen erlaubt
+    shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+    for i in range(len(longer)):
+        if longer[:i] + longer[i + 1:] == shorter:
+            return True
+    return False
+
+
+def _names_match(a, b):
+    """Vergleicht zwei bereits normalisierte Vornamen. Exakt gleich,
+    ODER einer ist Praefix des anderen (typisch fuer im Quell-PDF
+    abgeschnittene Namen, z.B. 'wolfgan' vs 'wolfgang', 'seb' vs
+    'sebastian' - siehe Nutzer-Bestaetigung), ODER Levenshtein-Distanz <= 1
+    bei Namen ab 4 Zeichen (enge Schreibvarianten wie 'philip'/'phillip').
+    Der Nachname muss IMMER exakt uebereinstimmen (siehe match_betreuer) -
+    diese Unschaerfe gilt nur fuer den Vornamen, um keine unterschiedlichen
+    Personen zu verwechseln."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(a) >= 3 and len(b) >= 3 and (a.startswith(b) or b.startswith(a)):
+        return True
+    if len(a) >= 4 and len(b) >= 4 and _levenshtein_le1(a, b):
+        return True
+    return False
+
+
+def load_betreuer_lookup(path):
+    """Laedt den CRM-Export 'Betreuer.xlsx' (Blaetter 'Privatkunden' mit
+    Anrede/Vorname/Nachname/Kundenverantwortliche und 'Firmenkunden' mit
+    u.a. Firmenname/Kundenverantwortliche) und baut daraus Nachschlage-
+    Strukturen fuer match_betreuer(). 'Calvin Keinarth' wird auf 'Andreas
+    Selle' umgemappt (siehe BETREUER_ALIASES)."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    by_surname = {}  # normalisierter Nachname -> [(normalisierter Vorname, Betreuer)]
+    people = []  # flache Liste (normalisierter Nachname, Vorname, Betreuer) - fuer Fuzzy-Nachname-Scan
+    companies = {}  # normalisierter (Rechtsform-bereinigter) Firmenname -> Betreuer
+
+    if "Privatkunden" in wb.sheetnames:
+        ws = wb["Privatkunden"]
+        header = [c.value for c in ws[1]]
+        if "Vorname" in header and "Nachname" in header and "Kundenverantwortliche" in header:
+            i_vor, i_nach, i_bet = (header.index(k) for k in
+                                     ("Vorname", "Nachname", "Kundenverantwortliche"))
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                vor, nach, bet = row[i_vor], row[i_nach], row[i_bet]
+                if not bet or not nach:
+                    continue
+                bet = BETREUER_ALIASES.get(normalize(str(bet)), bet)
+                nnach = normalize_for_match(_strip_geb(nach))
+                nvor = normalize_for_match(_strip_geb(vor))
+                if nnach:
+                    by_surname.setdefault(nnach, []).append((nvor, bet))
+                    people.append((nnach, nvor, bet))
+
+    if "Firmenkunden" in wb.sheetnames:
+        ws = wb["Firmenkunden"]
+        header = [c.value for c in ws[1]]
+        if "Firmenname" in header and "Kundenverantwortliche" in header:
+            i_firma, i_bet = header.index("Firmenname"), header.index("Kundenverantwortliche")
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                firma, bet = row[i_firma], row[i_bet]
+                if not bet or not firma:
+                    continue
+                bet = BETREUER_ALIASES.get(normalize(str(bet)), bet)
+                key = _strip_legal_form(normalize_for_match(firma))
+                if key:
+                    companies[key] = bet
+
+    return {"by_surname": by_surname, "people": people, "companies": companies}
+
+
+def match_betreuer(kunde, lookup):
+    """Ordnet einen extrahierten Kundennamen (z.B. 'Nachname, Vorname',
+    'Vorname Nachname' oder ein Firmenname) einem Betreuer aus dem CRM-
+    Export zu (siehe load_betreuer_lookup()).
+
+    Geprueft wird stufenweise, von streng zu locker (exakt vor unscharf,
+    Nachname vor Vorname), und bei jeder Stufe gilt: sobald genau EIN
+    Betreuer zu den Kandidaten passt, ist das Ergebnis "eindeutig genug"
+    und wird zurueckgegeben (Nutzer-Vorgabe: auch bei nicht exakter
+    Schreibweise zuordnen, wenn sonst klar ist, wer gemeint ist). Passen
+    mehrere unterschiedliche Betreuer auf derselben Stufe, gilt der Fall als
+    mehrdeutig - dann wird NICHT auf eine lockerere Stufe weiter versucht
+    (sonst waechst das Verwechslungsrisiko), sondern None geliefert (siehe
+    Kunde in Manuelle_Pruefung/unmatched-Uebersicht).
+
+    Stufen: 1) Nachname exakt + Vorname exakt, 2) Nachname exakt + Vorname
+    unscharf, 3) Nachname unscharf + Vorname exakt, 4) Nachname unscharf +
+    Vorname unscharf."""
+    if not kunde:
+        return None
+    kunde = str(kunde).strip()
+
+    candidate_pairs = []
+    if "," in kunde:
+        a, b = (p.strip() for p in kunde.split(",", 1))
+        candidate_pairs.append((normalize_for_match(a), normalize_for_match(b)))  # Nachname, Vorname
+    tokens = kunde.replace(",", " ").split()
+    if len(tokens) >= 2:
+        first = normalize_for_match(tokens[0])
+        rest = normalize_for_match(" ".join(tokens[1:]))
+        candidate_pairs.append((rest, first))  # Nachname=rest, Vorname=erstes Token
+        candidate_pairs.append((first, rest))  # falls Vorname zuerst steht
+
+    for nachname, vorname in candidate_pairs:
+        if not nachname or not vorname:
+            continue
+
+        exact = [bet for vn, bet in lookup["by_surname"].get(nachname, []) if vn == vorname]
+        distinct = set(exact)
+        if len(distinct) == 1:
+            return distinct.pop()
+        if len(distinct) > 1:
+            continue  # mehrdeutig auf dieser Stufe -> nicht lockerer weiterversuchen
+
+        fuzzy_vor = [bet for vn, bet in lookup["by_surname"].get(nachname, []) if _names_match(vn, vorname)]
+        distinct = set(fuzzy_vor)
+        if len(distinct) == 1:
+            return distinct.pop()
+        if len(distinct) > 1:
+            continue
+
+        exact_vor_fuzzy_nach = [bet for nn, vn, bet in lookup["people"]
+                                 if vn == vorname and nn != nachname and _names_match(nn, nachname)]
+        distinct = set(exact_vor_fuzzy_nach)
+        if len(distinct) == 1:
+            return distinct.pop()
+        if len(distinct) > 1:
+            continue
+
+        fuzzy_both = [bet for nn, vn, bet in lookup["people"]
+                      if nn != nachname and _names_match(nn, nachname) and _names_match(vn, vorname)]
+        distinct = set(fuzzy_both)
+        if len(distinct) == 1:
+            return distinct.pop()
+
+    company_key = _strip_legal_form(normalize_for_match(kunde))
+    if company_key in lookup["companies"]:
+        return lookup["companies"][company_key]
+    return None
+
+
 def extract_bank_credits(path, password=""):
     """Liest einen VR-Bank-Rhein-Neckar-Kontoauszug (PDF mit normalem
     Textlayer) und liefert alle Buchungen (nicht nur Gutschriften) als Liste
@@ -1826,6 +2035,24 @@ def process_files(files, month_label, progress_callback=None):
     return df_rows, df_control, df_agg, df_problem
 
 
+def apply_betreuer(df_rows, lookup):
+    """Ergaenzt df_rows um eine Spalte 'Betreuer' (siehe match_betreuer())
+    sowie je eine Spalte pro Partner (PARTNER_NAMES) mit dem jeweiligen
+    Betrag der Zeile (sonst leer) - fuer die farbige Kunde_Provision-
+    Ansicht bzw. die PDF-Uebersicht. Optionaler Schritt: wird nur
+    aufgerufen, wenn eine Betreuer.xlsx verfuegbar ist (siehe main()/
+    app.py) - ohne diesen Aufruf bleibt df_rows unveraendert."""
+    if df_rows is None or df_rows.empty:
+        return df_rows
+    df_rows = df_rows.copy()
+    df_rows["Betreuer"] = df_rows["Kunde"].apply(lambda k: match_betreuer(k, lookup))
+    for partner in PARTNER_NAMES:
+        df_rows[partner] = df_rows.apply(
+            lambda r, p=partner: r["Provision"] if r["Betreuer"] == p else None, axis=1
+        )
+    return df_rows
+
+
 def write_excel(df_rows, df_control, df_agg, df_problem, out_target, df_bank_unmatched=None):
     """Schreibt die Ergebnis-Tabellen als (optisch aufbereitete) Excel-Datei
     mit den vier Standard-Blaettern (siehe README: Aufbau der Ausgabe-Excel).
@@ -1838,10 +2065,15 @@ def write_excel(df_rows, df_control, df_agg, df_problem, out_target, df_bank_unm
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
+    has_betreuer = df_rows is not None and "Betreuer" in df_rows.columns
+    kunde_cols = ["Versicherer", "Kunde", "Provision", "Datei", "Seite", "Quelle", "Rohzeile"]
+    kunde_currency = {"Provision"}
+    if has_betreuer:
+        kunde_cols = kunde_cols + ["Betreuer"] + PARTNER_NAMES
+        kunde_currency = kunde_currency | set(PARTNER_NAMES)
+
     sheets = [
-        ("Kunde_Provision", df_rows,
-         ["Versicherer", "Kunde", "Provision", "Datei", "Seite", "Quelle", "Rohzeile"],
-         {"Provision"}),
+        ("Kunde_Provision", df_rows, kunde_cols, kunde_currency),
         ("Kontrolle", df_control,
          ["Versicherer", "Datei", "Anzahl_Buchungen", "Summe_extrahiert",
           "Summe_lt_PDF", "Differenz", "Hinweis"],
@@ -1859,13 +2091,45 @@ def write_excel(df_rows, df_control, df_agg, df_problem, out_target, df_bank_unm
             ["datum", "betrag", "sender", "verwendungszweck"],
             {"betrag"},
         ))
+    if has_betreuer:
+        df_unmatched = df_rows[df_rows["Betreuer"].isna()][
+            ["Versicherer", "Kunde", "Provision", "Datei"]
+        ].drop_duplicates()
+        sheets.append((
+            "Kunde_ohne_Betreuer", df_unmatched,
+            ["Versicherer", "Kunde", "Provision", "Datei"],
+            {"Provision"},
+        ))
 
     with pd.ExcelWriter(out_target, engine="openpyxl") as writer:
         for sheet_name, df, default_cols, currency_cols in sheets:
             (df if not df.empty else pd.DataFrame(columns=default_cols)).to_excel(
-                writer, sheet_name=sheet_name, index=False
+                writer, sheet_name=sheet_name, index=False, columns=default_cols
             )
             _style_worksheet(writer.sheets[sheet_name], df, default_cols, currency_cols)
+            if sheet_name == "Kunde_Provision" and has_betreuer:
+                _color_betreuer_rows(writer.sheets[sheet_name], df, default_cols)
+
+
+def _color_betreuer_rows(ws, df, columns):
+    """Faerbt jede Zeile der Kunde_Provision-Tabelle je nach zugeordnetem
+    Betreuer ein (siehe PARTNER_COLORS_XLSX, Nutzer-Vorgabe Rot/Gelb/Blau) -
+    so ist beim Ueberfliegen der Tabelle auf einen Blick erkennbar, wer
+    fuer welchen Umsatz verantwortlich ist. Zeilen ohne Zuordnung
+    (Betreuer leer) bleiben ungefaerbt (siehe Kunde_ohne_Betreuer-Blatt)."""
+    from openpyxl.styles import PatternFill
+
+    if df is None or df.empty or "Betreuer" not in df.columns:
+        return
+    fills = {p: PatternFill(start_color=c, end_color=c, fill_type="solid")
+             for p, c in PARTNER_COLORS_XLSX.items()}
+    n_cols = len(columns)
+    for row_idx, betreuer in enumerate(df["Betreuer"], start=2):
+        fill = fills.get(betreuer)
+        if not fill:
+            continue
+        for col_idx in range(1, n_cols + 1):
+            ws.cell(row=row_idx, column=col_idx).fill = fill
 
 
 def _style_worksheet(ws, df, columns, currency_cols):
@@ -1948,11 +2212,32 @@ def build_summary_pdf(df_rows, out_target, month_label):
         pdf.output(out_target)
         return
 
-    per_customer = df_rows.groupby(["Versicherer", "Kunde"], as_index=False)["Provision"].sum()
+    has_betreuer = "Betreuer" in df_rows.columns
+    if has_betreuer:
+        per_customer = df_rows.groupby(["Versicherer", "Kunde", "Betreuer"], as_index=False,
+                                        dropna=False)["Provision"].sum()
+    else:
+        per_customer = df_rows.groupby(["Versicherer", "Kunde"], as_index=False)["Provision"].sum()
+        per_customer["Betreuer"] = None
     insurer_totals = per_customer.groupby("Versicherer")["Provision"].sum().sort_values(ascending=False)
 
     pdf.set_font("helvetica", "", 11)
     pdf.cell(0, 7, f"Gesamtsumme: {_fmt_eur(insurer_totals.sum())}", new_x="LMARGIN", new_y="NEXT")
+
+    if has_betreuer:
+        pdf.set_font("helvetica", "", 9)
+        y_legend = pdf.get_y() + 1
+        x_legend = pdf.l_margin
+        for partner in PARTNER_NAMES:
+            r, g, b = PARTNER_SWATCH_COLORS_PDF[partner]
+            pdf.set_fill_color(r, g, b)
+            pdf.rect(x_legend, y_legend + 0.5, 4, 4, "F")
+            pdf.set_xy(x_legend + 5, y_legend)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(55, 5, partner)
+            x_legend += 60
+        pdf.set_y(y_legend + 6)
+
     pdf.ln(3)
 
     left_w, gap, right_w = 55, 5, 125
@@ -1997,7 +2282,9 @@ def build_summary_pdf(df_rows, out_target, month_label):
                 pdf.add_page()
                 y = pdf.t_margin
             pdf.set_xy(x_right, y)
+            pdf.set_text_color(*PARTNER_COLORS_PDF.get(row.Betreuer, (0, 0, 0)))
             pdf.multi_cell(right_w, right_line_h, f"{row.Kunde} - {_fmt_eur(row.Provision)}")
+            pdf.set_text_color(0, 0, 0)
             y = pdf.get_y()
         y_right_end, page_right_end = y, pdf.page_no()
 
@@ -2041,6 +2328,16 @@ def main():
         print(f"  verarbeite {filename} ...")
 
     df_rows, df_control, df_agg, df_problem = process_files(files, month_folder, report_progress)
+
+    betreuer_path = os.path.join(BASE_DIR, "Betreuer.xlsx")
+    if os.path.isfile(betreuer_path):
+        lookup = load_betreuer_lookup(betreuer_path)
+        df_rows = apply_betreuer(df_rows, lookup)
+        n_unmatched = int(df_rows["Betreuer"].isna().sum()) if not df_rows.empty else 0
+        print(f"Betreuer.xlsx gefunden - Kunden zugeordnet ({n_unmatched} ohne Zuordnung, "
+              "siehe Blatt 'Kunde_ohne_Betreuer').")
+    else:
+        print("Hinweis: Betreuer.xlsx nicht gefunden - keine Betreuer-Zuordnung erstellt.")
 
     out_dir = os.path.join(TOOL_DIR, "output", month_folder)
     out_path = os.path.join(out_dir, f"Kunde_Provision_{month_folder}.xlsx")

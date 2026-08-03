@@ -136,6 +136,12 @@ uploaded_bank_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
+uploaded_betreuer_file = st.file_uploader(
+    "Betreuer.xlsx (optional) - ordnet jeden Umsatz Robin Heckmann/Tim Selle/Andreas Selle "
+    "zu und markiert die Kundenzeilen farbig (Rot/Gelb/Blau)",
+    type=["xlsx"],
+)
+
 make_pdf_summary = st.checkbox(
     "PDF-Uebersicht zusaetzlich erstellen (Versicherer nach Umsatz sortiert, "
     "mit Kunden/Vertraegen je Versicherer)"
@@ -169,6 +175,13 @@ if process_clicked and uploaded_files:
         )
         progress_bar.empty()
         status_text.empty()
+
+        if uploaded_betreuer_file is not None:
+            betreuer_dest = os.path.join(tmp_dir, re.sub(r"[\\/]", "_", uploaded_betreuer_file.name))
+            with open(betreuer_dest, "wb") as fh:
+                fh.write(uploaded_betreuer_file.getbuffer())
+            betreuer_lookup = ce.load_betreuer_lookup(betreuer_dest)
+            df_rows = ce.apply_betreuer(df_rows, betreuer_lookup)
 
         df_bank_unmatched = None
         if uploaded_bank_files:
@@ -227,6 +240,19 @@ if process_clicked and uploaded_files:
         if not df_problem.empty:
             st.subheader("Manuelle Pruefung noetig")
             st.dataframe(df_problem, use_container_width=True)
+
+        if "Betreuer" in df_rows.columns:
+            df_unmatched_betreuer = df_rows[df_rows["Betreuer"].isna()][
+                ["Versicherer", "Kunde", "Provision", "Datei"]
+            ].drop_duplicates()
+            if not df_unmatched_betreuer.empty:
+                st.subheader("Kunden ohne Betreuer-Zuordnung")
+                st.warning(
+                    f"{len(df_unmatched_betreuer)} Kunde(n) konnten keinem Betreuer eindeutig "
+                    "zugeordnet werden - bitte manuell pruefen (auch im Excel-Blatt "
+                    "'Kunde_ohne_Betreuer')."
+                )
+                st.dataframe(df_unmatched_betreuer, use_container_width=True)
 
         if df_bank_unmatched is not None:
             st.subheader("Zahlungseingaenge ohne passende Abrechnung")

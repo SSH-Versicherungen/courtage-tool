@@ -1,9 +1,10 @@
 # Courtage-Extraktor
 
 Liest die Courtageabrechnungs-PDFs eines Monats ein und extrahiert je
-Buchungszeile: **Versicherer, Kunde, Provision**. Das ist der erste Baustein
-der monatlichen Courtage-Abrechnung (Kunde -> Betreuer-Zuordnung folgt als
-nächster Schritt und ist bewusst noch nicht Teil dieses Skripts).
+Buchungszeile: **Versicherer, Kunde, Provision**. Optional (wenn eine
+`Betreuer.xlsx` bereitgestellt wird) ordnet es jede Buchung zusätzlich einem
+der drei Partner zu und markiert sie farbig - siehe "Betreuer-Zuordnung"
+unten.
 
 Es gibt zwei Wege, das Tool monatlich zu nutzen: eine **Web-Oberfläche im
 Browser** (empfohlen, kein Terminal nötig) oder die **Kommandozeile**
@@ -24,13 +25,15 @@ Es öffnet sich automatisch ein Browserfenster (falls nicht:
    auswählen (Mehrfachauswahl möglich).
 3. Optional: den/die Kontoauszug/-züge (VR Bank Rhein-Neckar) desselben
    Monats zusätzlich hochladen - siehe "Kontoauszug-Abgleich" unten.
-4. Optional: Häkchen bei "PDF-Übersicht zusätzlich erstellen" setzen - siehe
+4. Optional: `Betreuer.xlsx` hochladen - siehe "Betreuer-Zuordnung" unten.
+5. Optional: Häkchen bei "PDF-Übersicht zusätzlich erstellen" setzen - siehe
    "PDF-Übersicht" unten.
-5. Auf **Verarbeiten** klicken.
-6. Ergebnis direkt im Browser ansehen (Kontrolltabelle, Sammelbelege,
-   manuelle Prüfung, alle Buchungszeilen, ggf. fehlende Abrechnungen) und
-   über **Excel-Ergebnis herunterladen** als `.xlsx`-Datei speichern (bzw.
-   zusätzlich **PDF-Übersicht herunterladen**, falls angehakt).
+6. Auf **Verarbeiten** klicken.
+7. Ergebnis direkt im Browser ansehen (Kontrolltabelle, Sammelbelege,
+   manuelle Prüfung, alle Buchungszeilen, ggf. fehlende Abrechnungen, ggf.
+   Kunden ohne Betreuer-Zuordnung) und über **Excel-Ergebnis herunterladen**
+   als `.xlsx`-Datei speichern (bzw. zusätzlich **PDF-Übersicht
+   herunterladen**, falls angehakt).
 
 Um die Web-Oberfläche zu beenden, im Terminal-Fenster `Strg+C` drücken (oder
 das Fenster schließen). Beim nächsten Monat einfach erneut `streamlit run
@@ -60,6 +63,11 @@ erstellt (siehe unten):
 ```bash
 python courtage_extraktor.py Juli-2026 --pdf-uebersicht
 ```
+
+Liegt eine Datei `Betreuer.xlsx` direkt im `Umsatz`-Ordner (eine Ebene über
+`Courtage-Tool/`), wird sie automatisch erkannt und für die Betreuer-
+Zuordnung verwendet (siehe "Betreuer-Zuordnung" unten) - kein zusätzliches
+Flag nötig.
 
 Für einen neuen Monat ist **keine Anpassung am Skript nötig** - nur der
 Ordnername als Argument (CLI) bzw. die Monat/Jahr-Auswahl (Web-Oberfläche)
@@ -96,10 +104,15 @@ auf, enthält selbst keine Extraktionslogik).
   zuverlässig automatisch auslesbar.
 - **Fehlende_Abrechnungen** - nur vorhanden, wenn beim Verarbeiten mindestens
   ein Kontoauszug mit hochgeladen wurde (siehe "Kontoauszug-Abgleich" unten).
+- **Kunde_ohne_Betreuer** - nur vorhanden, wenn eine `Betreuer.xlsx`
+  bereitgestellt wurde (siehe "Betreuer-Zuordnung" unten): Kunden, die
+  keinem der drei Partner eindeutig zugeordnet werden konnten.
 
-Alle vier/fünf Blätter sind formatiert (fette blaue Kopfzeile, Auto-Filter,
-passende Spaltenbreiten, Währungsformat für Beträge); im Blatt "Kontrolle"
-wird eine von 0 abweichende "Differenz" rot hervorgehoben.
+Alle Blätter sind formatiert (fette blaue Kopfzeile, Auto-Filter, passende
+Spaltenbreiten, Währungsformat für Beträge); im Blatt "Kontrolle" wird eine
+von 0 abweichende "Differenz" rot hervorgehoben. Ist eine `Betreuer.xlsx`
+bereitgestellt, sind im Blatt "Kunde_Provision" zusätzlich alle Zeilen eines
+zugeordneten Kunden farbig markiert (siehe unten).
 
 ## PDF-Übersicht (optional)
 
@@ -113,6 +126,46 @@ innerhalb eines Versicherers erscheinen als eine Zeile).
 
 Web-Oberfläche: Häkchen "PDF-Übersicht zusätzlich erstellen" vor dem Klick
 auf "Verarbeiten". Kommandozeile: Flag `--pdf-uebersicht` (siehe oben).
+
+## Betreuer-Zuordnung (optional)
+
+Ordnet jede Buchungszeile einem der drei Partner (Robin Heckmann, Tim Selle,
+Andreas Selle) zu, basierend auf dem "Kundenverantwortliche"-Feld im
+internen CRM (`https://ssh-versicherungen.insurgo.cloud/dashboard`). Da
+Andreas Selle dort keinen eigenen Account hat, werden seine Kunden im CRM
+unter "Calvin Keinarth" geführt - das Tool rechnet diese automatisch
+Andreas Selle zu (`BETREUER_ALIASES`).
+
+Voraussetzung: eine `Betreuer.xlsx` (CRM-Export mit den Blättern
+"Privatkunden" und "Firmenkunden", Spalten u.a. Vorname/Nachname bzw.
+Firmenname und "Kundenverantwortliche"). Diese Datei enthält echte
+Kundendaten und liegt bewusst **außerhalb** des Git-Repos, direkt im
+`Umsatz`-Ordner - CLI: wird dort automatisch gefunden (siehe oben);
+Web-Oberfläche: muss pro Sitzung hochgeladen werden (Streamlit Cloud hat
+keinen Zugriff auf die lokale Festplatte).
+
+Ist eine `Betreuer.xlsx` vorhanden, ergänzt das Tool im Blatt
+"Kunde_Provision" die Spalte "Betreuer" sowie je eine Spalte pro Partner mit
+dessen Anteil der jeweiligen Zeile, und markiert die ganze Zeile farbig:
+**Rot = Robin Heckmann, Gelb = Tim Selle, Blau = Andreas Selle** (in der
+PDF-Übersicht entsprechend der Kundentext eingefärbt, mit Legende oben auf
+der Seite) - so sind Zuordnung bzw. Abweichungen beim Überfliegen sofort
+sichtbar.
+
+Namensabgleich (`match_betreuer()`): zuerst exakt, sonst mit kontrollierter
+Unschärfe (abgeschnittene oder leicht abweichend geschriebene Vor-/Nachnamen,
+z.B. weil das Quell-PDF eines Versicherers Namen abschneidet) - aber **nur**,
+wenn dabei eindeutig genau ein Partner infrage kommt. Ist das Ergebnis
+mehrdeutig (mehrere Partner mit ähnlich passendem Namen) oder findet sich
+gar kein Kandidat, bleibt der Kunde absichtlich unzugeordnet (kein Fill,
+taucht im Blatt "Kunde_ohne_Betreuer" auf) statt geraten zu werden.
+Geburtsname-Zusätze wie "(geb. Bock)" oder "geb.: Pleli" werden vor dem
+Abgleich entfernt. Firmenkunden werden zusätzlich über den (um Rechtsform-
+Endungen wie GmbH/UG/KG bereinigten) Firmennamen abgeglichen.
+
+Hinweis: Der CRM-Export bildet den Stand zum Zeitpunkt des Exports ab - bei
+sehr aktuellen Änderungen im CRM (neue Kunden, Betreuer-Wechsel) empfiehlt
+sich vor der monatlichen Abrechnung ein frischer Export.
 
 ## Kontoauszug-Abgleich (optional)
 
@@ -300,6 +353,8 @@ falsche oder erfundene Zahlen zu liefern.
     und Web-Oberfläche,
   - `extract_bank_credits()`/`reconcile_bank_credits()`: der optionale
     Kontoauszug-Abgleich (siehe eigener Abschnitt oben).
+  - `load_betreuer_lookup()`/`match_betreuer()`/`apply_betreuer()`: die
+    optionale Betreuer-Zuordnung (siehe eigener Abschnitt oben).
 - Neue Versicherer mit "normaler" Tabellenstruktur sollten ohne Codeänderung
   funktionieren. Taucht ein neuer Versicherer in "Sammelbelege_ohne_Details"
   auf, obwohl er eigentlich Positionsdaten haben müsste, oder ein neues
