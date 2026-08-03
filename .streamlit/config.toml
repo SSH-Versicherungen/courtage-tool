@@ -7,3 +7,12 @@ headless = true
 
 [browser]
 gatherUsageStats = false
+
+# Farbschema angelehnt an das SSH-Logo (dunkles Navy, klassische Serifen-
+# Optik, viel Weissraum).
+[theme]
+primaryColor = "#242A4E"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F4F6"
+textColor = "#1A1A1A"
+font = "serif"

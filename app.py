@@ -22,7 +22,35 @@ import streamlit as st
 
 import courtage_extraktor as ce
 
-st.set_page_config(page_title="Courtage-Extraktor", page_icon="📄", layout="wide")
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+LOGO_PATH = os.path.join(ASSETS_DIR, "ssh_logo.png")
+FAVICON_PATH = os.path.join(ASSETS_DIR, "favicon.png")
+
+st.set_page_config(
+    page_title="Courtage-Extraktor",
+    page_icon=FAVICON_PATH if os.path.exists(FAVICON_PATH) else "📄",
+    layout="wide",
+)
+
+# Dezente Anpassungen, die ueber .streamlit/config.toml (Theme-Farben,
+# Serifenschrift) hinausgehen: zentriertes Logo, etwas Luft darunter.
+st.markdown(
+    """
+    <style>
+    div[data-testid="stImage"] { display: flex; justify-content: center; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def show_header():
+    if os.path.exists(LOGO_PATH):
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.image(LOGO_PATH, use_container_width=True)
+    else:
+        st.title("Courtage-Extraktor")
 
 
 def require_password():
@@ -43,7 +71,7 @@ def require_password():
     if st.session_state.get("password_ok"):
         return True
 
-    st.title("📄 Courtage-Extraktor")
+    show_header()
     pw = st.text_input("Passwort", type="password")
     if st.button("Anmelden"):
         if pw == required:
@@ -57,7 +85,11 @@ def require_password():
 if not require_password():
     st.stop()
 
-st.title("📄 Courtage-Extraktor")
+show_header()
+st.markdown(
+    "<h3 style='text-align:center; font-weight:400; color:#242A4E;'>Courtage-Extraktor</h3>",
+    unsafe_allow_html=True,
+)
 st.caption(
     "Courtageabrechnungs-PDFs eines Monats hochladen -> Kunde + Provision je "
     "Buchung automatisch auslesen -> Ergebnis als Excel herunterladen."
