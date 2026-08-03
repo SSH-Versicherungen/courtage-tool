@@ -1,0 +1,16 @@
+# Generierte Ergebnisse enthalten echte Kunden-/Provisionsdaten - gehoeren
+# niemals ins Repository (auch nicht in ein privates).
+output/
+
+# Lokales Tesseract-Sprachpaket (nur fuer Windows-Installation ohne
+# Schreibzugriff auf Program Files) - auf Streamlit Cloud wird stattdessen
+# tesseract-ocr-deu per apt installiert, siehe packages.txt.
+tessdata/
+
+# Python
+__pycache__/
+*.pyc
+
+# Streamlit-Secrets duerfen niemals committet werden (Passwort!) - werden
+# stattdessen direkt im Streamlit-Cloud-Dashboard hinterlegt.
+.streamlit/secrets.toml

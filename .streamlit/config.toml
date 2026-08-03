@@ -1,0 +1,9 @@
+# Standardeinstellungen fuer "streamlit run app.py":
+# Nur auf localhost erreichbar (nicht im Netzwerk/Internet sichtbar) -
+# die verarbeiteten PDFs enthalten Kunden- und Provisionsdaten.
+[server]
+address = "127.0.0.1"
+headless = true
+
+[browser]
+gatherUsageStats = false
