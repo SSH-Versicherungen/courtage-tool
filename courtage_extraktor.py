@@ -482,11 +482,17 @@ def extract_generic_table(pages_words):
                     # position auf Folgezeilen fuer ein anderes Feld.
                     name_text = ""
 
+            # Von rechts nach links das erste als Zahl parsebare Wort in der
+            # Betragsspalte nehmen - nicht nur die letzten ein/zwei Woerter
+            # pruefen: manche Abrechnungen (z.B. Blaudirekt) haengen nach dem
+            # Betrag noch einen Hinweis wie "Festbetrag" an, der sonst die
+            # Zeile faelschlich verwerfen wuerde (Betrag stuende dann drei
+            # statt zwei Woerter vor Zeilenende).
             amount_val = None
-            if amount_words:
-                amount_val = parse_amount(amount_words[-1]["text"])
-                if amount_val is None and len(amount_words) > 1:
-                    amount_val = parse_amount(amount_words[-2]["text"])
+            for w in reversed(amount_words):
+                amount_val = parse_amount(w["text"])
+                if amount_val is not None:
+                    break
 
             if name_text:
                 current_customer = name_text
