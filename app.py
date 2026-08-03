@@ -69,7 +69,9 @@ with st.expander("So funktioniert's", expanded=False):
         "in den PDFs wichtig, z.B. bei Abrechnungen, die einen Abschnitt "
         "fuer den Folgemonat enthalten).\n"
         "2. Alle PDFs des Monats hochladen (Mehrfachauswahl/Drag & Drop "
-        "moeglich).\n"
+        "moeglich) - die VEMA-Pool-CSV-Datei(en) (`VEMA-Poolabrechnung-"
+        "N.csv`) koennen einfach mit hochgeladen werden, werden automatisch "
+        "erkannt.\n"
         "3. Optional: den Kontoauszug (VR Bank Rhein-Neckar) desselben "
         "Monats hochladen - dann wird zusaetzlich geprueft, ob es "
         "Zahlungseingaenge ohne passende Abrechnungs-PDF gibt.\n"
@@ -88,8 +90,8 @@ with col2:
 month_label = f"{month_name}-{year}"
 
 uploaded_files = st.file_uploader(
-    "Courtageabrechnungs-PDFs hierher ziehen oder auswaehlen",
-    type=["pdf"],
+    "Courtageabrechnungs-PDFs (+ ggf. VEMA-Pool-CSV) hierher ziehen oder auswaehlen",
+    type=["pdf", "csv"],
     accept_multiple_files=True,
 )
 

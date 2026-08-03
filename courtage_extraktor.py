@@ -28,12 +28,16 @@ Aufbau, kurz:
   PDF-Erzeugung (Text pro Seite komplett gespiegelt/verdreht) -> eigene,
   koordinatenbasierte Parser (siehe extract_allianz/extract_axa/
   extract_gothaer).
-- Dialog liefert eine echte Kundenpositionstabelle, aber im Scan zu
-  klein/dicht fuer zuverlaessige OCR (Kommastellen kippen) -> bleibt
-  manuelle Pruefung, nur ein OCR-Kontrollbetrag wird ermittelt (siehe
-  find_dialog_total_hint).
+- Dialog und Continentale liefern echte Kundenpositionstabellen, aber im
+  Scan zu klein/dicht/verschachtelt fuer zuverlaessige OCR -> bleiben
+  manuelle Pruefung statt falsche Zahlen zu riskieren (bei Dialog zusaetzlich
+  ein OCR-Kontrollbetrag, siehe find_dialog_total_hint).
+- VEMA-Pool liefert Kundenpositionen nicht im PDF, sondern separat als CSV
+  (VEMA-Poolabrechnung-N.csv) -> wird automatisch mitverarbeitet, wenn sie
+  im Monatsordner liegt bzw. mit hochgeladen wird (siehe extract_vema_csv).
 """
 
+import csv
 import glob
 import os
 import re
@@ -597,6 +601,33 @@ def extract_vn_summevertrag_block(pages_words):
     return rows
 
 
+SWISS_LIFE_VSV_RE = re.compile(
+    r"BeiträgezurVertrauensschadenversicherung\s+[\d.,]+\s+(-?[\d.,]+)\s+(-?[\d.,]+)"
+)
+
+
+def extract_swiss_life_vsv_deduction(pages_full_text):
+    """Swiss Life behaelt pro Abrechnung einen pauschalen (nicht kunden-
+    bezogenen) Beitrag zur Vertrauensschadenversicherung ein - anders als
+    urspruenglich angenommen wird dieser NICHT separat von RH persoenlich
+    getragen, sondern ist direkt von der Abschlussprovision abzuziehen
+    (Nutzer-Rueckmeldung). Er steht explizit auf der "Abrechnungsuebersicht
+    zum ..."-Seite (nicht auf der "Kumulierte Jahreswerte"-Seite, die
+    dieselbe Zeile fuer das gesamte Jahr zeigt) als eigene Zeile
+    "BeitraegezurVertrauensschadenversicherung <Gutschrift> <Belastung>
+    <Saldo>", z.B. "... 0,00 -3,58 -3,58" - der Saldo-Wert wird als eigene,
+    ausdruecklich nicht-kundenspezifische Abzugszeile zurueckgegeben."""
+    for pidx, text in pages_full_text:
+        if "SummenausaktuellerAbrechnung" not in text:
+            continue
+        m = SWISS_LIFE_VSV_RE.search(text)
+        if m:
+            saldo = parse_amount(m.group(2))
+            if saldo:
+                return pidx, saldo, m.group(0)
+    return None
+
+
 VHV_ADDR_RE = re.compile(r"^(.+?),\s*.+?,\s*\d{5}\s+\S")
 
 
@@ -1019,6 +1050,88 @@ def extract_alte_leipziger(pages_words):
     return rows
 
 
+BARMENIA_NAME_RE = re.compile(r"^([A-ZÀ-Ü][A-Za-zà-ÿ\-]+),\s*([A-ZÀ-Ü][A-Za-zà-ÿ\-]+)")
+BARMENIA_NUM_RE = re.compile(r"-?\d{1,3}(?:\.\d{3})*,\d{2}")
+
+
+def extract_barmenia(pdf):
+    """Barmenia/Gothaer 'Vergluetungsnachweis Abschlussverguetungen'
+    (gescannt): der Standard-OCR-Pfad (300dpi) verliert auf den
+    Detailseiten regelmaessig die eigentlichen Betragsspalten (zu dicht/
+    klein gedruckte Tabelle) - hoehere Aufloesung (400dpi) mit
+    tabellenorientiertem OCR-Modus (--psm 6) als Fliesstext liest sie
+    zuverlaessig. Pro Kundenzeile (Muster 'Nachname, Vorname ...') steht
+    der Verguetungsbetrag doppelt hintereinander (Verguetungsbetrag =
+    Abgerechneter Betrag, sofern kein Storno/keine Proration) - dieses
+    Zahlenpaar wird als der gesuchte Betrag genommen. Nur Seiten mit
+    'Verguetungsnachweis' im Text enthalten Kundenpositionen (Deckblatt/
+    Kontoauszug/Gesamtuebersicht-Seiten werden uebersprungen)."""
+    rows = []
+    for pidx, page in enumerate(pdf.pages):
+        if len(page.chars) > 0:
+            continue
+        quick_text = pytesseract.image_to_string(page.to_image(resolution=200).original, lang="deu")
+        if "vergütungsnachweis" not in quick_text.lower():
+            continue
+        im = page.to_image(resolution=400).original
+        text = pytesseract.image_to_string(im, lang="deu", config="--psm 6")
+        for line in text.splitlines():
+            m = BARMENIA_NAME_RE.match(line.strip())
+            if not m:
+                continue
+            name = f"{m.group(1)} {m.group(2)}"
+            amounts = [parse_amount(a) for a in BARMENIA_NUM_RE.findall(line)]
+            amt = None
+            for i in range(len(amounts) - 1):
+                if amounts[i] == amounts[i + 1] and amounts[i]:
+                    amt = amounts[i]
+                    break
+            if amt is not None:
+                rows.append((pidx, name, amt, line.strip(), "ocr"))
+    return rows
+
+
+VEMA_CSV_AMOUNT_COL = "Betrag"
+
+
+def extract_vema_csv(path):
+    """VEMA-Pool liefert die Kundenpositionen NICHT im PDF (das ist ein
+    reiner Sammelbeleg, siehe README), sondern separat als CSV-Export
+    ('VEMA-Poolabrechnung-N.csv'). Spalten (Semikolon-getrennt):
+    VEMAintern;VN Anrede;VN Vorname;VN Nachname;Vertragsnummer;
+    Gesellschaft;Sparte;Faelligkeit;Provisionsbasis;Courtage;
+    Provisionsart;Einbehalt;Betrag;...
+
+    'Courtage' ist der Brutto-Courtagebetrag, 'Betrag' der Betrag NACH
+    Abzug des VEMA-Poolbeitrags (siehe Spalte 'Einbehalt', typischerweise
+    10%). Anders als z.B. bei Fondsfinanz's Stornoreserve (temporaere
+    Sicherheit, siehe extract_fondsfinanz) ist der VEMA-Einbehalt ein
+    dauerhafter Pool-Verwaltungsbeitrag, der SSH nie zufliesst - massgeblich
+    ist daher 'Betrag' (netto), nicht 'Courtage' (brutto)."""
+    rows = []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        if VEMA_CSV_AMOUNT_COL not in (reader.fieldnames or []):
+            return rows
+        for row in reader:
+            anrede = (row.get("VN Anrede") or "").strip()
+            vorname = (row.get("VN Vorname") or "").strip()
+            nachname = (row.get("VN Nachname") or "").strip()
+            if anrede == "Firma" or not vorname:
+                name = nachname
+            else:
+                name = f"{nachname}, {vorname}"
+            betrag_s = (row.get(VEMA_CSV_AMOUNT_COL) or "").strip()
+            if not betrag_s or not name:
+                continue
+            betrag = parse_amount(betrag_s)
+            if betrag is None:
+                continue
+            raw_line = ";".join(f"{k}={v}" for k, v in row.items() if v)
+            rows.append((0, name, round(betrag, 2), raw_line, "csv"))
+    return rows
+
+
 def find_total_in_text(full_text):
     """Sucht best-effort einen Gesamt-/Endbetrag im Freitext (fuer
     Sammelbelege ohne Kundendetail, zur Kontrolle)."""
@@ -1247,8 +1360,9 @@ def find_dialog_total_hint(pdf):
 # und Firmierungs-Zusaetze werden faelschlich als "Kunde" erkannt). Lieber
 # ehrlich zur manuellen Pruefung markieren als falsche Zuordnungen liefern.
 # Alte Leipziger ist NICHT mehr hier: die Scans sind sauber, siehe
-# extract_alte_leipziger().
-OCR_UNRELIABLE_INSURERS = ["dialog"]
+# extract_alte_leipziger(). Barmenia ebenfalls nicht mehr: die Detailseiten
+# lesen sich bei 400dpi/psm6 zuverlaessig, siehe extract_barmenia().
+OCR_UNRELIABLE_INSURERS = ["dialog", "continentale"]
 
 
 def insurer_name_from_filename(filename, month_folder):
@@ -1347,6 +1461,26 @@ def process_file(filepath, month_folder):
                 "rows": [], "total_hint": total_hint,
             }
 
+        if insurer_lower == "barmenia" and OCR_AVAILABLE:
+            # Barmenia/Gothaer 'Vergluetungsnachweis': gescanntes PDF, dessen
+            # Detailtabelle mit dem Standard-OCR-Pfad (300dpi, wortpositions-
+            # basiert) die Betragsspalten verliert - eigener Pfad mit
+            # hoeherer Aufloesung, siehe extract_barmenia().
+            rows = extract_barmenia(pdf)
+            total_hint = find_total_in_text(full_text)
+            if not rows:
+                return {
+                    "insurer": insurer, "file": filename, "status": "sammelbeleg",
+                    "reason": "Kein Kunden-Positionsdetail im PDF gefunden - "
+                              "vermutlich reiner Sammelbeleg/Kontoauszug ohne "
+                              "Einzelaufstellung.",
+                    "rows": [], "total_hint": total_hint,
+                }
+            return {
+                "insurer": insurer, "file": filename, "status": "ok",
+                "reason": "OCR verwendet", "rows": rows, "total_hint": total_hint,
+            }
+
         if insurer_lower == "arag" and OCR_AVAILABLE:
             # ARAG-Einzelaufstellung: gescanntes PDF, dessen Tabelle mit dem
             # Standard-OCR-Pfad (300dpi, wortpositionsbasiert) zu schlecht
@@ -1430,6 +1564,14 @@ def process_file(filepath, month_folder):
             # Tabelle (Bestandspflege) und ein Block-Format
             # (Einzelaufstellung, "VN/VP ... Summe Vertrag").
             rows = extract_generic_table(pages_words) + extract_vn_summevertrag_block(pages_words)
+            vsv = extract_swiss_life_vsv_deduction(list(enumerate(full_text_parts)))
+            if vsv:
+                vsv_page, vsv_amount, vsv_line = vsv
+                rows.append((
+                    vsv_page,
+                    "Vertrauensschadenversicherung-Beitrag (nicht kundenspezifisch, siehe Abrechnungsuebersicht)",
+                    round(vsv_amount, 2), vsv_line, "text",
+                ))
         elif "sparkassenversicherung" in insurer_lower:
             rows = extract_sv_sparkasse(pages_words)
         else:
@@ -1462,13 +1604,35 @@ def process_file(filepath, month_folder):
         pdf.close()
 
 
+def process_csv_file(filepath):
+    """Verarbeitet eine VEMA-Pool-CSV (siehe extract_vema_csv). Liefert
+    dasselbe Ergebnis-Dict-Format wie process_file(), damit process_files()
+    PDFs und CSVs einheitlich behandeln kann."""
+    filename = os.path.basename(filepath)
+    rows = extract_vema_csv(filepath)
+    if not rows:
+        return {
+            "insurer": "VEMA-Pool", "file": filename, "status": "sammelbeleg",
+            "reason": "Keine erkennbaren Buchungszeilen in der CSV-Datei "
+                      "gefunden (falsches Spaltenformat?).",
+            "rows": [], "total_hint": None,
+        }
+    return {
+        "insurer": "VEMA-Pool", "file": filename, "status": "ok",
+        "reason": "", "rows": rows, "total_hint": None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def process_files(files, month_label, progress_callback=None):
-    """Verarbeitet eine Liste von PDF-Pfaden und liefert die vier Ergebnis-
-    Tabellen (df_rows, df_control, df_agg, df_problem) als DataFrames.
+    """Verarbeitet eine Liste von PDF- und/oder CSV-Pfaden und liefert die
+    vier Ergebnis-Tabellen (df_rows, df_control, df_agg, df_problem) als
+    DataFrames. CSV-Dateien (z.B. VEMA-Poolabrechnung-N.csv) werden ueber
+    process_csv_file() statt process_file() verarbeitet, siehe
+    extract_vema_csv().
 
     progress_callback (optional): wird nach jeder Datei mit
     (index, gesamt, dateiname) aufgerufen - fuer Fortschrittsanzeigen in
@@ -1481,7 +1645,10 @@ def process_files(files, month_label, progress_callback=None):
     for i, f in enumerate(files):
         if progress_callback:
             progress_callback(i, len(files), os.path.basename(f))
-        result = process_file(f, month_label)
+        if f.lower().endswith(".csv"):
+            result = process_csv_file(f)
+        else:
+            result = process_file(f, month_label)
         insurer = result["insurer"]
         filename = result["file"]
         status = result["status"]
@@ -1494,7 +1661,7 @@ def process_files(files, month_label, progress_callback=None):
                     "Provision": provision,
                     "Datei": filename,
                     "Seite": page_idx + 1,
-                    "Quelle": "OCR" if source == "ocr" else "Text",
+                    "Quelle": {"ocr": "OCR", "csv": "CSV"}.get(source, "Text"),
                     "Rohzeile": raw_line,
                 })
             extracted_sum = sum(r[2] for r in result["rows"])
@@ -1635,9 +1802,11 @@ def main():
         print(f"Ordner nicht gefunden: {input_dir}")
         sys.exit(1)
 
-    pattern = os.path.join(input_dir, "Abrechnung-*.pdf")
-    files = sorted(glob.glob(pattern))
-    print(f"Gefunden: {len(files)} Abrechnungs-PDFs in {month_folder}")
+    pdf_files = sorted(glob.glob(os.path.join(input_dir, "Abrechnung-*.pdf")))
+    csv_files = sorted(glob.glob(os.path.join(input_dir, "VEMA-Poolabrechnung-*.csv")))
+    files = pdf_files + csv_files
+    print(f"Gefunden: {len(pdf_files)} Abrechnungs-PDFs und {len(csv_files)} "
+          f"VEMA-Pool-CSV(s) in {month_folder}")
 
     def report_progress(i, total, filename):
         print(f"  verarbeite {filename} ...")

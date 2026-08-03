@@ -73,7 +73,9 @@ auf, enthält selbst keine Extraktionslogik).
   Sammelbetrag ohne jede Kundenaufschlüsselung enthält: aktuell nur ARAG
   (reiner Kontoauszug/Avise, keine Einzelposten in diesem PDF) und VEMA-Pool
   (verweist im PDF-Text explizit auf eine separat ausgelieferte CSV-Datei mit
-  den Einzelverträgen, die nicht Teil dieser PDFs ist). Wichtig: mehrseitige
+  den Einzelverträgen - siehe "VEMA-Pool-CSV" unten, diese CSV wird
+  inzwischen automatisch mitverarbeitet, wenn sie im Monatsordner liegt).
+  Wichtig: mehrseitige
   Sammelabrechnungen wie Mannheimer, VHV, Swiss Life, HDI-Leben oder SV
   Sparkassenversicherung haben ihre Kundenpositionen oft erst auf hinteren
   Seiten ("Einzelposten", "Anhang", "Provisionsberechnungsnachweis") - diese
@@ -129,6 +131,20 @@ passt) und unterstützt bisher nur das Kontoauszug-Format der VR Bank
 Rhein-Neckar. Vor einer Rückfrage beim Versicherer den Treffer in der
 Rohspalte "Absender"/"Verwendungszweck" gegenprüfen.
 
+## VEMA-Pool-CSV
+
+VEMA-Pool liefert die Kundenpositionen nicht im PDF (das bleibt ein reiner
+Sammelbeleg), sondern als separate CSV-Datei(en)
+(`VEMA-Poolabrechnung-<N>.csv`, Semikolon-getrennt). Liegt eine solche CSV
+im selben Monatsordner wie die PDFs, wird sie automatisch mitverarbeitet
+(CLI: `python courtage_extraktor.py <Monat>` findet sie über das Muster
+`VEMA-Poolabrechnung-*.csv`; Web-Oberfläche: einfach mit hochladen, die
+Endung `.csv` wird erkannt). Verwendet wird die Spalte "Betrag" (Courtage
+NACH Abzug des VEMA-Pool-Verwaltungsbeitrags/"Einbehalt", z.B. 10% - dieser
+Einbehalt ist anders als z.B. Fondsfinanz' Stornoreserve ein dauerhafter
+Abzug, der SSH nie zufließt, daher zählt hier der Netto- statt der
+Brutto-Betrag "Courtage"). Siehe `extract_vema_csv()`.
+
 ## Grenzen der aktuellen Version
 
 - **AIG**: gelöst - AIG druckt die Provisions-/Courtage-Spalte immer mit
@@ -159,6 +175,29 @@ Rohspalte "Absender"/"Verwendungszweck" gegenprüfen.
   der/den Folgezeile(n) - wird pro Block gesammelt und bei "Zwischensumme"
   zugeordnet. Summe je Teil-Abrechnung stimmt exakt mit der "Zahlungsausgang"-
   Zeile im PDF überein.
+- **Barmenia (bzw. Barmenia/Gothaer)**: gelöst - siehe `extract_barmenia()`.
+  Gescanntes "Vergütungsnachweis Abschlussvergütungen"-PDF, bei dem der
+  Standard-OCR-Pfad (300dpi) die Betragsspalten auf der Detailseite verliert;
+  bei 400dpi + tabellenorientiertem OCR-Modus (`--psm 6`) sind sie lesbar.
+  Der Vergütungsbetrag steht pro Kundenzeile zweimal identisch hintereinander
+  (Vergütungsbetrag = Abgerechneter Betrag) - dieses Zahlenpaar wird als
+  Betrag genommen.
+- **Continentale**: bleibt manuelle Prüfung. Gescanntes, aber stark
+  verschachteltes Mehrzeilen-Tabellenformat (Positions- und Beitragswerte
+  über mehrere Zeilen mit viel Rahmen-/Trennzeichen-Bildrauschen verteilt) -
+  mehrere OCR-Auflösungen/-Modi wurden ausprobiert, liefern aber keine
+  zuverlässig zuordenbaren Zahlen. Bleibt bewusst Handarbeit statt falsche
+  Zuordnungen zu riskieren.
+- **Swiss Life - Vertrauensschadenversicherung**: Swiss Life behält pro
+  Abrechnung einen pauschalen (nicht kundenbezogenen) Beitrag zur
+  Vertrauensschadenversicherung ein, der direkt von der Gesamt-Courtage
+  abzuziehen ist (Nutzer-Rückmeldung - frühere Annahme, dieser Beitrag werde
+  separat privat verrechnet, war falsch). Er steht explizit auf der
+  "Abrechnungsübersicht zum ..."-Seite (nicht auf der "Kumulierte
+  Jahreswerte"-Seite, die denselben Zeilennamen fürs gesamte Jahr zeigt) als
+  eigene Zeile "Beiträge zur Vertrauensschadenversicherung" - wird als
+  eigene, ausdrücklich nicht-kundenspezifische Abzugszeile ergänzt, siehe
+  `extract_swiss_life_vsv_deduction()`.
 - **Dialog**: bleibt manuelle Prüfung. Die Kundenpositions-Tabelle
   (L0100 "Provisionseinzelnachweis") ist im Scan zu klein/dicht gedruckt
   (teils zusätzlich durch Textmarker-Anmerkungen überdeckt) - mehrere OCR-
