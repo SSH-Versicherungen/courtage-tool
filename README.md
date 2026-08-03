@@ -24,10 +24,13 @@ Es öffnet sich automatisch ein Browserfenster (falls nicht:
    auswählen (Mehrfachauswahl möglich).
 3. Optional: den/die Kontoauszug/-züge (VR Bank Rhein-Neckar) desselben
    Monats zusätzlich hochladen - siehe "Kontoauszug-Abgleich" unten.
-4. Auf **Verarbeiten** klicken.
-5. Ergebnis direkt im Browser ansehen (Kontrolltabelle, Sammelbelege,
+4. Optional: Häkchen bei "PDF-Übersicht zusätzlich erstellen" setzen - siehe
+   "PDF-Übersicht" unten.
+5. Auf **Verarbeiten** klicken.
+6. Ergebnis direkt im Browser ansehen (Kontrolltabelle, Sammelbelege,
    manuelle Prüfung, alle Buchungszeilen, ggf. fehlende Abrechnungen) und
-   über **Excel-Ergebnis herunterladen** als `.xlsx`-Datei speichern.
+   über **Excel-Ergebnis herunterladen** als `.xlsx`-Datei speichern (bzw.
+   zusätzlich **PDF-Übersicht herunterladen**, falls angehakt).
 
 Um die Web-Oberfläche zu beenden, im Terminal-Fenster `Strg+C` drücken (oder
 das Fenster schließen). Beim nächsten Monat einfach erneut `streamlit run
@@ -50,6 +53,12 @@ ignoriert).
 Ergebnis liegt danach hier:
 ```
 Courtage-Tool/output/<Monat>/Kunde_Provision_<Monat>.xlsx
+```
+
+Mit dem optionalen Flag `--pdf-uebersicht` wird zusätzlich die PDF-Übersicht
+erstellt (siehe unten):
+```bash
+python courtage_extraktor.py Juli-2026 --pdf-uebersicht
 ```
 
 Für einen neuen Monat ist **keine Anpassung am Skript nötig** - nur der
@@ -91,6 +100,19 @@ auf, enthält selbst keine Extraktionslogik).
 Alle vier/fünf Blätter sind formatiert (fette blaue Kopfzeile, Auto-Filter,
 passende Spaltenbreiten, Währungsformat für Beträge); im Blatt "Kontrolle"
 wird eine von 0 abweichende "Differenz" rot hervorgehoben.
+
+## PDF-Übersicht (optional)
+
+Erstellt eine kompakte PDF-Zusammenfassung (`Courtage-Uebersicht_<Monat>.pdf`,
+`build_summary_pdf()`): je Versicherer **absteigend nach Gesamtumsatz**
+sortiert, mit der zugehörigen Kunden-/Vertragsaufstellung (ebenfalls
+absteigend nach Betrag) direkt daneben. Rein informativ/optisch - nutzt nur
+die bereits extrahierten Zeilen, keine neue Extraktionslogik. Kundenbeträge
+werden je Versicherer aufsummiert (mehrere Buchungen desselben Kunden
+innerhalb eines Versicherers erscheinen als eine Zeile).
+
+Web-Oberfläche: Häkchen "PDF-Übersicht zusätzlich erstellen" vor dem Klick
+auf "Verarbeiten". Kommandozeile: Flag `--pdf-uebersicht` (siehe oben).
 
 ## Kontoauszug-Abgleich (optional)
 

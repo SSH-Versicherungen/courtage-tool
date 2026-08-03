@@ -1917,12 +1917,115 @@ def _style_worksheet(ws, df, columns, currency_cols):
         )
 
 
+def _fmt_eur(x):
+    """Deutsches Zahlenformat (Komma als Dezimaltrennzeichen, Punkt als
+    Tausendertrennzeichen), z.B. 1234.5 -> '1.234,50 EUR'. 'EUR' statt '€'
+    ausgeschrieben, da die Standard-PDF-Schrift (helvetica) das
+    Euro-Zeichen nicht unterstuetzt."""
+    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + " EUR"
+
+
+def build_summary_pdf(df_rows, out_target, month_label):
+    """Erstellt eine einseitige (bzw. mehrseitige) PDF-Uebersicht: je
+    Versicherer absteigend nach Gesamtumsatz sortiert, mit der jeweiligen
+    Kunden-/Vertragsaufstellung (ebenfalls absteigend nach Betrag) direkt
+    daneben. Rein informativ/optisch - keine neue Extraktionslogik, nutzt
+    nur die bereits extrahierten Zeilen aus process_files().
+
+    out_target: Dateipfad (str) oder datei-artiges Objekt (z.B. io.BytesIO
+    fuer die Web-Oberflaeche)."""
+    from fpdf import FPDF
+
+    pdf = FPDF(format="A4", unit="mm")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("helvetica", "B", 16)
+    pdf.cell(0, 10, f"Courtage-Uebersicht {month_label}", new_x="LMARGIN", new_y="NEXT")
+
+    if df_rows is None or df_rows.empty:
+        pdf.set_font("helvetica", "", 11)
+        pdf.cell(0, 8, "Keine Buchungszeilen vorhanden.")
+        pdf.output(out_target)
+        return
+
+    per_customer = df_rows.groupby(["Versicherer", "Kunde"], as_index=False)["Provision"].sum()
+    insurer_totals = per_customer.groupby("Versicherer")["Provision"].sum().sort_values(ascending=False)
+
+    pdf.set_font("helvetica", "", 11)
+    pdf.cell(0, 7, f"Gesamtsumme: {_fmt_eur(insurer_totals.sum())}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    left_w, gap, right_w = 55, 5, 125
+    left_margin = pdf.l_margin
+
+    for versicherer, total in insurer_totals.items():
+        customers = per_customer[per_customer["Versicherer"] == versicherer].sort_values(
+            "Provision", ascending=False
+        )
+
+        # Vor jedem Block pruefen, ob der Versicherer-Name + mindestens die
+        # erste Kundenzeile noch auf die aktuelle Seite passen - sonst
+        # Seitenumbruch VOR dem Block (statt mittendrin) fuer ein saubereres
+        # Layout.
+        if pdf.get_y() + 16 > pdf.page_break_trigger:
+            pdf.add_page()
+
+        y_start = pdf.get_y()
+        page_start = pdf.page_no()
+        x_left = left_margin
+        x_right = left_margin + left_w + gap
+        right_line_h = 5
+
+        pdf.set_xy(x_left, y_start)
+        pdf.set_font("helvetica", "B", 11)
+        pdf.multi_cell(left_w, 6, versicherer)
+        pdf.set_x(x_left)
+        pdf.set_font("helvetica", "", 9)
+        pdf.multi_cell(left_w, 5, f"Gesamt:\n{_fmt_eur(total)}")
+        y_left_end, page_left_end = pdf.get_y(), pdf.page_no()
+
+        # Rechte Spalte zeilenweise mit manueller Seitenumbruch-Kontrolle
+        # ausgeben (statt multi_cell()): so bleiben linke/rechte Spalte auch
+        # bei einem Umbruch mitten in einer langen Kundenliste konsistent
+        # positioniert, statt dass darunterliegender Inhalt auf der falschen
+        # Seite landet und grosse Luecken entstehen.
+        pdf.set_xy(x_right, y_start)
+        pdf.set_font("helvetica", "", 9)
+        y = y_start
+        for row in customers.itertuples():
+            if y + right_line_h > pdf.page_break_trigger:
+                pdf.add_page()
+                y = pdf.t_margin
+            pdf.set_xy(x_right, y)
+            pdf.multi_cell(right_w, right_line_h, f"{row.Kunde} - {_fmt_eur(row.Provision)}")
+            y = pdf.get_y()
+        y_right_end, page_right_end = y, pdf.page_no()
+
+        # Falls die rechte Spalte einen Seitenumbruch ausgeloest hat, ist
+        # y_left_end (von der vorherigen Seite) fuer die Positionierung von
+        # Trennlinie/naechstem Block irrelevant - sonst wuerde eine grosse,
+        # falsch platzierte Luecke auf der neuen Seite entstehen. Es zaehlt
+        # immer die Spalte, die zuletzt (auf der spaeteren Seite) endet.
+        if page_right_end != page_left_end:
+            y_end = y_right_end if page_right_end > page_left_end else y_left_end
+        else:
+            y_end = max(y_left_end, y_right_end)
+
+        pdf.set_xy(x_left, y_end + 2)
+        pdf.set_draw_color(200, 200, 200)
+        pdf.line(x_left, pdf.get_y(), x_right + right_w, pdf.get_y())
+        pdf.ln(3)
+
+    pdf.output(out_target)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Aufruf: python courtage_extraktor.py <Monatsordner z.B. Juni-2026>")
+        print("Aufruf: python courtage_extraktor.py <Monatsordner z.B. Juni-2026> [--pdf-uebersicht]")
         sys.exit(1)
 
     month_folder = sys.argv[1]
+    make_pdf_summary = "--pdf-uebersicht" in sys.argv[2:]
     input_dir = os.path.join(BASE_DIR, month_folder)
     if not os.path.isdir(input_dir):
         print(f"Ordner nicht gefunden: {input_dir}")
@@ -1948,6 +2051,11 @@ def main():
     print(f"  - {len(df_agg)} Datei(en) als Sammelbeleg ohne Kundendetail")
     print(f"  - {len(df_problem)} Datei(en) zur manuellen Pruefung")
     print(f"Ausgabe: {out_path}")
+
+    if make_pdf_summary:
+        pdf_path = os.path.join(out_dir, f"Courtage-Uebersicht_{month_folder}.pdf")
+        build_summary_pdf(df_rows, pdf_path, month_folder)
+        print(f"PDF-Uebersicht: {pdf_path}")
 
 
 if __name__ == "__main__":

@@ -136,6 +136,11 @@ uploaded_bank_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
+make_pdf_summary = st.checkbox(
+    "PDF-Uebersicht zusaetzlich erstellen (Versicherer nach Umsatz sortiert, "
+    "mit Kunden/Vertraegen je Versicherer)"
+)
+
 process_clicked = st.button("Verarbeiten", type="primary", disabled=not uploaded_files)
 
 if process_clicked and uploaded_files:
@@ -200,6 +205,17 @@ if process_clicked and uploaded_files:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
+
+        if make_pdf_summary:
+            pdf_buffer = io.BytesIO()
+            ce.build_summary_pdf(df_rows, pdf_buffer, month_label)
+            pdf_buffer.seek(0)
+            st.download_button(
+                "⬇️ PDF-Uebersicht herunterladen",
+                data=pdf_buffer,
+                file_name=f"Courtage-Uebersicht_{month_label}.pdf",
+                mime="application/pdf",
+            )
 
         st.subheader("Kontrolle je Datei")
         st.dataframe(df_control, use_container_width=True)
