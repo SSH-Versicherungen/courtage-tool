@@ -1369,6 +1369,46 @@ PARTNER_SWATCH_COLORS_PDF = {
     "Andreas Selle": (50, 110, 220),
 }
 
+# Manuelle Korrekturen fuer Kunden, die match_betreuer() ueber die
+# Betreuer.xlsx nicht (mehr) zuverlaessig finden kann - z.B. weil der Name
+# im Quell-PDF stark abgekuerzt/abweichend ist, weil es sich um einen
+# Handelsnamen statt des CRM-Firmennamens handelt, oder weil sich der
+# Nachname zwischenzeitlich geaendert hat (Heirat) und daher keine noch so
+# lockere Schreibvarianz je zum CRM-Namen passen wuerde. Vom Nutzer per
+# Hand bestaetigt (Stand Juli 2026) - Key ist der ORIGINALE, im PDF
+# auftauchende Kundenname (wird ueber normalize_for_match() abgeglichen,
+# siehe apply_betreuer()). Bei neuen Faellen einfach ergaenzen; langfristig
+# sauberer ist es, die Ursache direkt in der Betreuer.xlsx zu pflegen
+# (z.B. Namensaenderung/Status "inaktiv" bei Rosen Adrian).
+MANUAL_BETREUER_OVERRIDES_RAW = {
+    "HVP": "Robin Heckmann",  # High Voltage Projects GmbH
+    "Brötzmann Tanja": "Robin Heckmann",
+    "Heckmann, Oliver": "Robin Heckmann",
+    "Aghaie Pour": "Robin Heckmann",  # Hamid Aghaiepour
+    "Shalamanova Snezhanka Dan": "Tim Selle",  # Snezhana Danailova Shalamanova
+    "Calhanoglu Muhammed": "Robin Heckmann",
+    "Rieker Anagbogu": "Robin Heckmann",  # Elvira Rieker Anagbogu
+    "Rosen Adrian": "Robin Heckmann",  # in CRM als inaktiv markiert, aber aktiv
+    "Dos Santos Card": "Robin Heckmann",  # Paulo Dos Santos Cardoso
+    "Die Peperonis Heddesh": "Robin Heckmann",  # Die Peperonis Heddesheim Inh. Tuerkmen & Dornsbach
+    "Pension Wohlgelegen": "Tim Selle",  # Pension Wohlgelegen Natascha San Miguel Teran
+    "Turbo team Hatice Sengönül": "Robin Heckmann",  # Turbo Team Umzuege & Transporte
+    "Hoffmann Holding Gmb": "Tim Selle",  # Hoffmann Holding GmbH
+    "Gutperle & Czech": "Andreas Selle",  # Gutperle & Czech Projektentwicklungs GmbH
+    "Katzir-Shimo": "Robin Heckmann",  # Alon Katzir-Shimoni
+    "Saßmann-Herz": "Robin Heckmann",  # Gunther Saßmann
+    "Van der": "Tim Selle",  # Karin Van der Raaij
+    "Stasiak, Alexander": "Tim Selle",  # jetzt Alexander Weickel (Heirat)
+    "Erbrecht, Felix": "Robin Heckmann",  # jetzt Felix Aleman (Heirat)
+}
+
+# Kennzeichen fuer nicht-kundenspezifische Sammelabzuege innerhalb einer
+# Abrechnung (z.B. Fondsfinanz-Stornoreserve, Swiss-Life-VSV-Beitrag, siehe
+# extract_swiss_life_vsv_deduction()) - werden in apply_betreuer() separat
+# behandelt (Zuordnung zur groessten Kundenposition derselben Datei), nicht
+# ueber die normale Namenszuordnung.
+COLLECTIVE_DEDUCTION_MARKER = "nicht kundenspezifisch"
+
 GEB_RE = re.compile(r"\(geb\.?[^)]*\)|\bgeb\.?:?\s.*$", re.IGNORECASE)
 LEGAL_FORM_SUFFIXES = ["gmbhcokg", "gmbh", "cokg", "ug", "ev", "ag", "se", "kg", "ohg", "gbr"]
 
@@ -2036,16 +2076,40 @@ def process_files(files, month_label, progress_callback=None):
 
 
 def apply_betreuer(df_rows, lookup):
-    """Ergaenzt df_rows um eine Spalte 'Betreuer' (siehe match_betreuer())
-    sowie je eine Spalte pro Partner (PARTNER_NAMES) mit dem jeweiligen
-    Betrag der Zeile (sonst leer) - fuer die farbige Kunde_Provision-
-    Ansicht bzw. die PDF-Uebersicht. Optionaler Schritt: wird nur
-    aufgerufen, wenn eine Betreuer.xlsx verfuegbar ist (siehe main()/
-    app.py) - ohne diesen Aufruf bleibt df_rows unveraendert."""
+    """Ergaenzt df_rows um eine Spalte 'Betreuer' (siehe match_betreuer(),
+    MANUAL_BETREUER_OVERRIDES_RAW) sowie je eine Spalte pro Partner
+    (PARTNER_NAMES) mit dem jeweiligen Betrag der Zeile (sonst leer) - fuer
+    die farbige Kunde_Provision-Ansicht bzw. die PDF-Uebersicht. Optionaler
+    Schritt: wird nur aufgerufen, wenn eine Betreuer.xlsx verfuegbar ist
+    (siehe main()/app.py) - ohne diesen Aufruf bleibt df_rows unveraendert."""
     if df_rows is None or df_rows.empty:
         return df_rows
     df_rows = df_rows.copy()
-    df_rows["Betreuer"] = df_rows["Kunde"].apply(lambda k: match_betreuer(k, lookup))
+
+    overrides = {normalize_for_match(k): v for k, v in MANUAL_BETREUER_OVERRIDES_RAW.items()}
+
+    def resolve(kunde):
+        override = overrides.get(normalize_for_match(kunde))
+        return override if override else match_betreuer(kunde, lookup)
+
+    df_rows["Betreuer"] = df_rows["Kunde"].apply(resolve)
+
+    # Nicht-kundenspezifische Sammelabzuege (Stornoreserve, VSV-Beitrag,
+    # siehe COLLECTIVE_DEDUCTION_MARKER) koennen nicht ueber einen Namen
+    # zugeordnet werden - sie werden stattdessen automatisch dem Betreuer
+    # der betragsmaessig groessten (bereits zugeordneten) Kundenposition
+    # derselben Abrechnungsdatei zugerechnet (Nutzer-Beispiel: die
+    # Fondsfinanz-Stornoreserve gehoert zu Robin Heckmann, weil dessen
+    # Kunde Heckmann, Oliver die mit Abstand groesste Position in
+    # derselben Abrechnung ist).
+    collective_mask = df_rows["Kunde"].str.contains(COLLECTIVE_DEDUCTION_MARKER, na=False)
+    for idx in df_rows[collective_mask].index:
+        datei = df_rows.at[idx, "Datei"]
+        same_file = df_rows[(df_rows["Datei"] == datei) & ~collective_mask & df_rows["Betreuer"].notna()]
+        if not same_file.empty:
+            top_row = same_file.loc[same_file["Provision"].abs().idxmax()]
+            df_rows.at[idx, "Betreuer"] = top_row["Betreuer"]
+
     for partner in PARTNER_NAMES:
         df_rows[partner] = df_rows.apply(
             lambda r, p=partner: r["Provision"] if r["Betreuer"] == p else None, axis=1
@@ -2101,7 +2165,15 @@ def write_excel(df_rows, df_control, df_agg, df_problem, out_target, df_bank_unm
             {"Provision"},
         ))
 
+    df_insurer_sum, df_partner_sum = _build_summary_frames(df_rows)
+
     with pd.ExcelWriter(out_target, engine="openpyxl") as writer:
+        df_insurer_sum.to_excel(writer, sheet_name="Zusammenfassung", index=False, startrow=0)
+        _style_worksheet(writer.sheets["Zusammenfassung"], df_insurer_sum,
+                          ["Versicherer", "Summe"], {"Summe"})
+        if df_partner_sum is not None:
+            _write_partner_summary(writer.sheets["Zusammenfassung"], df_insurer_sum, df_partner_sum)
+
         for sheet_name, df, default_cols, currency_cols in sheets:
             (df if not df.empty else pd.DataFrame(columns=default_cols)).to_excel(
                 writer, sheet_name=sheet_name, index=False, columns=default_cols
@@ -2109,6 +2181,65 @@ def write_excel(df_rows, df_control, df_agg, df_problem, out_target, df_bank_unm
             _style_worksheet(writer.sheets[sheet_name], df, default_cols, currency_cols)
             if sheet_name == "Kunde_Provision" and has_betreuer:
                 _color_betreuer_rows(writer.sheets[sheet_name], df, default_cols)
+
+
+def _build_summary_frames(df_rows):
+    """Baut die beiden Tabellen fuer das Blatt 'Zusammenfassung': Summe je
+    Versicherer (immer) sowie Summe je Partner inkl. 'Nicht zugeordnet'
+    (nur wenn eine Betreuer-Zuordnung vorliegt, sonst None)."""
+    if df_rows is None or df_rows.empty:
+        return pd.DataFrame(columns=["Versicherer", "Summe"]), None
+
+    df_insurer_sum = (
+        df_rows.groupby("Versicherer", as_index=False)["Provision"].sum()
+        .rename(columns={"Provision": "Summe"})
+        .sort_values("Summe", ascending=False)
+    )
+
+    df_partner_sum = None
+    if "Betreuer" in df_rows.columns:
+        rows = [{"Partner": p, "Summe": df_rows.loc[df_rows["Betreuer"] == p, "Provision"].sum()}
+                for p in PARTNER_NAMES]
+        rows.append({"Partner": "Nicht zugeordnet",
+                      "Summe": df_rows.loc[df_rows["Betreuer"].isna(), "Provision"].sum()})
+        df_partner_sum = pd.DataFrame(rows)
+
+    return df_insurer_sum, df_partner_sum
+
+
+def _write_partner_summary(ws, df_insurer_sum, df_partner_sum):
+    """Schreibt die 'Summe je Partner'-Tabelle unterhalb der Versicherer-
+    Summen in dasselbe Blatt (eigene Kopfzeile/Formatierung, da
+    _style_worksheet() von genau einer Tabelle ab Zeile 1 ausgeht)."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    start_row = len(df_insurer_sum) + 3
+    ws.cell(row=start_row, column=1, value="Partner")
+    ws.cell(row=start_row, column=2, value="Summe")
+
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for col_idx in (1, 2):
+        cell = ws.cell(row=start_row, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+
+    fills = {p: PatternFill(start_color=c, end_color=c, fill_type="solid")
+             for p, c in PARTNER_COLORS_XLSX.items()}
+    for i, row in enumerate(df_partner_sum.itertuples(), start=1):
+        row_idx = start_row + i
+        ws.cell(row=row_idx, column=1, value=row.Partner)
+        cell = ws.cell(row=row_idx, column=2, value=row.Summe)
+        cell.number_format = '#,##0.00 "€"'
+        fill = fills.get(row.Partner)
+        if fill:
+            ws.cell(row=row_idx, column=1).fill = fill
+            ws.cell(row=row_idx, column=2).fill = fill
+
+    ws.column_dimensions[get_column_letter(1)].width = max(ws.column_dimensions[get_column_letter(1)].width or 10, 20)
+    ws.column_dimensions[get_column_letter(2)].width = max(ws.column_dimensions[get_column_letter(2)].width or 10, 16)
 
 
 def _color_betreuer_rows(ws, df, columns):
@@ -2239,6 +2370,31 @@ def build_summary_pdf(df_rows, out_target, month_label):
         pdf.set_y(y_legend + 6)
 
     pdf.ln(3)
+
+    pdf.set_font("helvetica", "B", 11)
+    pdf.cell(0, 7, "Summe je Versicherer", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("helvetica", "", 9)
+    for versicherer, total in insurer_totals.items():
+        pdf.cell(100, 5, versicherer)
+        pdf.cell(0, 5, _fmt_eur(total), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    if has_betreuer:
+        pdf.set_font("helvetica", "B", 11)
+        pdf.cell(0, 7, "Monatsuebersicht", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("helvetica", "", 10)
+        for partner in PARTNER_NAMES:
+            total = df_rows.loc[df_rows["Betreuer"] == partner, "Provision"].sum()
+            r, g, b = PARTNER_COLORS_PDF[partner]
+            pdf.set_text_color(r, g, b)
+            pdf.cell(60, 6, partner)
+            pdf.cell(0, 6, _fmt_eur(total), new_x="LMARGIN", new_y="NEXT")
+        unmatched_total = df_rows.loc[df_rows["Betreuer"].isna(), "Provision"].sum()
+        pdf.set_text_color(120, 120, 120)
+        pdf.cell(60, 6, "Nicht zugeordnet")
+        pdf.cell(0, 6, _fmt_eur(unmatched_total), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(3)
 
     left_w, gap, right_w = 55, 5, 125
     left_margin = pdf.l_margin

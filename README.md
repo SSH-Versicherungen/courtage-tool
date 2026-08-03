@@ -107,6 +107,9 @@ auf, enthält selbst keine Extraktionslogik).
 - **Kunde_ohne_Betreuer** - nur vorhanden, wenn eine `Betreuer.xlsx`
   bereitgestellt wurde (siehe "Betreuer-Zuordnung" unten): Kunden, die
   keinem der drei Partner eindeutig zugeordnet werden konnten.
+- **Zusammenfassung** - immer das erste Blatt: Summe je Versicherer
+  (absteigend), darunter (falls eine `Betreuer.xlsx` bereitgestellt wurde)
+  Summe je Partner inkl. "Nicht zugeordnet".
 
 Alle Blätter sind formatiert (fette blaue Kopfzeile, Auto-Filter, passende
 Spaltenbreiten, Währungsformat für Beträge); im Blatt "Kontrolle" wird eine
@@ -117,12 +120,15 @@ zugeordneten Kunden farbig markiert (siehe unten).
 ## PDF-Übersicht (optional)
 
 Erstellt eine kompakte PDF-Zusammenfassung (`Courtage-Uebersicht_<Monat>.pdf`,
-`build_summary_pdf()`): je Versicherer **absteigend nach Gesamtumsatz**
-sortiert, mit der zugehörigen Kunden-/Vertragsaufstellung (ebenfalls
-absteigend nach Betrag) direkt daneben. Rein informativ/optisch - nutzt nur
-die bereits extrahierten Zeilen, keine neue Extraktionslogik. Kundenbeträge
-werden je Versicherer aufsummiert (mehrere Buchungen desselben Kunden
-innerhalb eines Versicherers erscheinen als eine Zeile).
+`build_summary_pdf()`): zu Beginn eine Summe je Versicherer sowie (bei
+vorhandener `Betreuer.xlsx`) eine Monatsübersicht je Partner, danach je
+Versicherer **absteigend nach Gesamtumsatz** sortiert, mit der zugehörigen
+Kunden-/Vertragsaufstellung (ebenfalls absteigend nach Betrag) direkt
+daneben - bei vorhandener Betreuer-Zuordnung farbig je Partner. Rein
+informativ/optisch - nutzt nur die bereits extrahierten Zeilen, keine neue
+Extraktionslogik. Kundenbeträge werden je Versicherer aufsummiert (mehrere
+Buchungen desselben Kunden innerhalb eines Versicherers erscheinen als eine
+Zeile).
 
 Web-Oberfläche: Häkchen "PDF-Übersicht zusätzlich erstellen" vor dem Klick
 auf "Verarbeiten". Kommandozeile: Flag `--pdf-uebersicht` (siehe oben).
@@ -166,6 +172,17 @@ Endungen wie GmbH/UG/KG bereinigten) Firmennamen abgeglichen.
 Hinweis: Der CRM-Export bildet den Stand zum Zeitpunkt des Exports ab - bei
 sehr aktuellen Änderungen im CRM (neue Kunden, Betreuer-Wechsel) empfiehlt
 sich vor der monatlichen Abrechnung ein frischer Export.
+
+Für Fälle, die auch mit Unschärfe nie zuverlässig auffindbar wären (z.B.
+Heiratsnamen wie "Stasiak" -> "Weickel", oder Handelsnamen, die vom
+CRM-Firmennamen stark abweichen) gibt es zusätzlich eine von Hand gepflegte
+Korrekturliste `MANUAL_BETREUER_OVERRIDES_RAW` in `courtage_extraktor.py`
+(Kundenname aus dem PDF -> Partner). Neue Fälle einfach melden, dann wird
+die Liste ergänzt - langfristig sauberer ist es, die Ursache direkt in der
+Betreuer.xlsx zu pflegen. Nicht-kundenspezifische Sammelabzüge innerhalb
+einer Abrechnung (z.B. Fondsfinanz-Stornoreserve) werden automatisch der
+größten Kundenposition derselben Datei zugerechnet, da sie selbst keinen
+Namen tragen.
 
 ## Kontoauszug-Abgleich (optional)
 
