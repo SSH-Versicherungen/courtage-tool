@@ -943,6 +943,102 @@ def extract_gothaer(pdf):
     return rows
 
 
+CONTINENTALE_NAME_RE = re.compile(r"([A-ZÀ-Ü][a-zà-ÿß]+-[A-ZÀ-Ü][a-zà-ÿß]+)")
+CONTINENTALE_CLEAN_AMT_RE = re.compile(r"\+(\d{1,3}(?:\.\d{3})*,\d{2})")
+CONTINENTALE_FALLBACK_AMT_RE = re.compile(r"[+H]\s*(\d{2,4})\b")
+CONTINENTALE_SALDO_RE = re.compile(r"Neuer Saldo:?\s*(-?[\d.,]+)")
+
+
+def _continentale_candidates(lines):
+    """Liefert je Namenszeile (name, sauberer_Betrag_oder_None,
+    Rueckfall_Betrag_oder_None, Zeile) - siehe extract_continentale()."""
+    out = []
+    for line in lines:
+        if "P__" not in line and "P___" not in line:
+            continue
+        m = CONTINENTALE_NAME_RE.search(line)
+        if not m:
+            continue
+        rest = line[m.end():]
+        clean = None
+        cm = CONTINENTALE_CLEAN_AMT_RE.search(rest)
+        if cm:
+            clean = parse_amount(cm.group(1))
+        fallback = None
+        fm = CONTINENTALE_FALLBACK_AMT_RE.search(rest)
+        if fm:
+            digits = fm.group(1)
+            # Bei manchen Zeilen faellt der OCR das Komma weg (z.B. "021"
+            # statt "0,21") - die letzten beiden Ziffern sind dann die
+            # Nachkommastellen (empirisch verifiziert: ergibt zusammen mit
+            # den sauber gelesenen Zeilen exakt den aufgedruckten "Neuer
+            # Saldo"-Betrag).
+            fallback = parse_amount(f"{digits[:-2] or '0'},{digits[-2:]}")
+        out.append((m.group(1), clean, fallback, line.strip()))
+    return out
+
+
+def extract_continentale(pdf):
+    """Continentale 'Provisionsnote Einzelergebnisse' (gescannt): sehr
+    dichte, mehrspaltige Tabelle mit viel Rahmen-/Trennzeichen-Bildrauschen,
+    bei der einzelne Betragswerte je nach OCR-Aufloesung mal sauber
+    ("+19,45"), mal mit verlorenem Komma ("+502" statt "+5,02") oder mit
+    Buchstaben-Ersatzzeichen ("H021" statt "+0,21", vermutlich ein
+    OCR-Fehllesen eines "+"-Symbols) gelesen werden - und das nicht
+    konsistent bei derselben Aufloesung fuer alle Zeilen.
+
+    Deshalb: OCR bei mehreren Aufloesungen (400/500/600dpi) durchfuehren,
+    je Namenszeile ueber die Reihenfolge (nicht den exakten Text, der pro
+    Aufloesung variiert) zuordnen und den saubersten verfuegbaren Treffer
+    nehmen (zuerst ein Betrag mit Komma, sonst die Ziffern-Rueckfalllogik).
+
+    Da diese Rueckfalllogik unvermeidbar heuristisch ist, wird das Ergebnis
+    IMMER gegen den auf der Kontoauszug-Seite aufgedruckten "Neuer Saldo"-
+    Betrag geprueft (siehe process_file()): stimmt die Summe nicht exakt
+    ueberein, werden die Zeilen verworfen und die Datei faellt automatisch
+    auf manuelle Pruefung zurueck, statt falsche Kundenzuordnungen zu
+    riskieren - passend zum Grundsatz "Summe der Einzelpositionen muss immer
+    dem Gesamtsaldo entsprechen, im Zweifel Rueckmeldung statt Raten"."""
+    rows = []
+    target_total = None
+    for pidx, page in enumerate(pdf.pages):
+        if len(page.chars) > 0:
+            continue
+        quick_text = pytesseract.image_to_string(page.to_image(resolution=200).original, lang="deu")
+        if target_total is None and "Neuer Saldo" in quick_text:
+            m = CONTINENTALE_SALDO_RE.search(quick_text)
+            if m:
+                target_total = parse_amount(m.group(1))
+        if "Einzelergebnisse" not in quick_text:
+            continue
+
+        per_resolution = []
+        for res in (400, 500, 600):
+            im = page.to_image(resolution=res).original
+            text = pytesseract.image_to_string(im, lang="deu", config="--psm 6")
+            per_resolution.append(_continentale_candidates(text.splitlines()))
+
+        n = max((len(c) for c in per_resolution), default=0)
+        for i in range(n):
+            entries = [c[i] for c in per_resolution if i < len(c)]
+            if not entries:
+                continue
+            name = entries[0][0]
+            amt, chosen_line = None, entries[0][3]
+            for _, clean, _fallback, line in entries:
+                if clean is not None:
+                    amt, chosen_line = clean, line
+                    break
+            if amt is None:
+                for _, _clean, fallback, line in entries:
+                    if fallback is not None:
+                        amt, chosen_line = fallback, line
+                        break
+            if amt is not None:
+                rows.append((pidx, name, round(amt, 2), chosen_line, "ocr"))
+    return rows, target_total
+
+
 def extract_alte_leipziger(pages_words):
     """Alte Leipziger (gescannt, OCR): sauber gescannte, saubere Tabelle
     ('Abrechnungskonto (Faellige Verguetungen)'), aber mit zwei Eigenheiten
@@ -1362,7 +1458,12 @@ def find_dialog_total_hint(pdf):
 # Alte Leipziger ist NICHT mehr hier: die Scans sind sauber, siehe
 # extract_alte_leipziger(). Barmenia ebenfalls nicht mehr: die Detailseiten
 # lesen sich bei 400dpi/psm6 zuverlaessig, siehe extract_barmenia().
-OCR_UNRELIABLE_INSURERS = ["dialog", "continentale"]
+# Continentale ebenfalls nicht mehr: eigener Multi-Aufloesungs-Pfad mit
+# Pflicht-Abgleich gegen den aufgedruckten "Neuer Saldo", siehe
+# extract_continentale() - faellt bei Abweichung selbst automatisch auf
+# manuelle Pruefung zurueck, muss deshalb nicht mehr hier pauschal
+# ausgeschlossen werden.
+OCR_UNRELIABLE_INSURERS = ["dialog"]
 
 
 def insurer_name_from_filename(filename, month_folder):
@@ -1459,6 +1560,31 @@ def process_file(filepath, month_folder):
                           "pruefen, NICHT als Sammelbeleg ohne Details "
                           "missverstehen.",
                 "rows": [], "total_hint": total_hint,
+            }
+
+        if insurer_lower == "continentale" and OCR_AVAILABLE:
+            # Continentale 'Provisionsnote Einzelergebnisse': sehr dichte,
+            # OCR-mehrdeutige Tabelle - siehe extract_continentale(). Das
+            # Ergebnis wird zwingend gegen den aufgedruckten "Neuer Saldo"
+            # geprueft; bei Abweichung faellt die Datei automatisch auf
+            # manuelle Pruefung zurueck statt falsche Zahlen zu liefern.
+            rows, target_total = extract_continentale(pdf)
+            extracted_sum = round(sum(r[2] for r in rows), 2)
+            if not rows or target_total is None or abs(extracted_sum - target_total) > 0.01:
+                return {
+                    "insurer": insurer, "file": filename, "status": "sonderformat",
+                    "reason": "OCR-Ergebnis der Kundenpositionen stimmt nicht "
+                              "(oder konnte nicht geprueft werden) mit dem im "
+                              "PDF aufgedruckten 'Neuer Saldo' ueberein "
+                              f"(extrahiert: {extracted_sum}, Soll: {target_total}) "
+                              "- bitte manuell pruefen, um keine falschen "
+                              "Kundenzuordnungen zu riskieren.",
+                    "rows": [], "total_hint": target_total,
+                }
+            return {
+                "insurer": insurer, "file": filename, "status": "ok",
+                "reason": "OCR verwendet, gegen 'Neuer Saldo' verifiziert",
+                "rows": rows, "total_hint": target_total,
             }
 
         if insurer_lower == "barmenia" and OCR_AVAILABLE:

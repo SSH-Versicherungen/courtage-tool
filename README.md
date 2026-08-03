@@ -182,12 +182,19 @@ Brutto-Betrag "Courtage"). Siehe `extract_vema_csv()`.
   Der Vergütungsbetrag steht pro Kundenzeile zweimal identisch hintereinander
   (Vergütungsbetrag = Abgerechneter Betrag) - dieses Zahlenpaar wird als
   Betrag genommen.
-- **Continentale**: bleibt manuelle Prüfung. Gescanntes, aber stark
-  verschachteltes Mehrzeilen-Tabellenformat (Positions- und Beitragswerte
-  über mehrere Zeilen mit viel Rahmen-/Trennzeichen-Bildrauschen verteilt) -
-  mehrere OCR-Auflösungen/-Modi wurden ausprobiert, liefern aber keine
-  zuverlässig zuordenbaren Zahlen. Bleibt bewusst Handarbeit statt falsche
-  Zuordnungen zu riskieren.
+- **Continentale**: gelöst - siehe `extract_continentale()`. Sehr dichtes,
+  OCR-mehrdeutiges Tabellenformat: derselbe Betrag wird je nach
+  OCR-Auflösung mal sauber ("+19,45"), mal mit verlorenem Komma ("+502"
+  statt "+5,02") oder mit Buchstaben-Ersatzzeichen ("H021" statt "+0,21")
+  gelesen. Der Parser probiert daher mehrere Auflösungen (400/500/600dpi)
+  und nimmt je Position den saubersten Treffer, mit einer Ziffern-Rückfall-
+  Heuristik für hartnäckige Fälle. Weil diese Heuristik unvermeidbar
+  fehleranfällig ist, wird das Ergebnis **immer** gegen den auf der
+  Kontoauszug-Seite aufgedruckten "Neuer Saldo" geprüft (siehe
+  `process_file()`): stimmt die Summe nicht exakt überein, fällt die Datei
+  automatisch auf manuelle Prüfung zurück, statt falsche Kundenzuordnungen
+  zu riskieren - passend zum Grundsatz "Summe der Einzelpositionen muss
+  immer dem Gesamtsaldo entsprechen, im Zweifel Rückmeldung statt Raten".
 - **Swiss Life - Vertrauensschadenversicherung**: Swiss Life behält pro
   Abrechnung einen pauschalen (nicht kundenbezogenen) Beitrag zur
   Vertrauensschadenversicherung ein, der direkt von der Gesamt-Courtage
