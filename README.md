@@ -239,12 +239,14 @@ Brutto-Betrag "Courtage"). Siehe `extract_vema_csv()`.
 
 ## Grenzen der aktuellen Version
 
-- **AIG**: gelöst - AIG druckt die Provisions-/Courtage-Spalte immer mit
-  nachgestelltem Minus, auch wenn der Betrag laut eigener Summenzeile
-  ("Summe Vermittler (Provision/Courtage zu Ihren Gunsten): ... 112,39-")
-  tatsächlich eine Gutschrift für den Makler ist - umgekehrte Vorzeichenlogik
-  zu allen anderen Versicherern. Wird im Code explizit umgedreht (siehe
-  `insurer_lower == "aig"`-Zweig in `process_file()`).
+- **AIG, Hiscox, Mannheimer**: gelöst - alle drei drucken ihre Betragsspalte
+  aus Sicht des Versicherers (dessen eigenes Soll/Haben) statt aus
+  Maklersicht: ein bei ihnen negativer Saldo ist für SSH eine Gutschrift und
+  umgekehrt. Bei AIG zusätzlich explizit belegt durch die Summenzeile
+  ("Summe Vermittler (Provision/Courtage zu Ihren Gunsten): ... 112,39-"),
+  bei Hiscox/Mannheimer vom Nutzer beim Juni-2026-Abgleich bestätigt.
+  Vorzeichen wird im Code explizit umgedreht (siehe `SIGN_INVERTED_INSURERS`
+  in `process_file()`).
 - **Allianz, AXA, Gothaer (Allgemeine + Leben)**: gelöst - siehe
   `extract_allianz()`/`extract_axa()`/`extract_gothaer()` im technischen
   Aufbau unten. Alle drei speichern den Text pro Seite gespiegelt/verdreht,
@@ -260,6 +262,11 @@ Brutto-Betrag "Courtage"). Siehe `extract_vema_csv()`.
   die Herleitung. Gothaer ist bisher nur an kleinen Ein-Kunden-Dateien
   verifiziert (Juni 2026 enthielt keine größeren Testfälle) - bei
   auffälligen Differenzen in der Kontrolle-Tabelle die Rohzeile prüfen.
+  AXA hat zusätzlich einen "Allgemeine Umsätze"-Abschnitt am Dateiende: eine
+  reine Kontoausgleichs-/Überweisungsbuchung ohne jede Namensreferenz wird
+  zu Recht nicht mitgezählt, eine "Umbuchung ... Prov.-Ausgleich"-Buchung
+  MIT nachfolgender "VN:Name"-Referenzzeile dagegen schon (Nutzer-Beispiel:
+  27,43 € für Kunde "Rosen") - siehe `extract_axa()`.
 - **Itzehoer**: PDF ist passwortgeschützt, kann so nicht geöffnet werden.
 - **Alte Leipziger**: gelöst - siehe `extract_alte_leipziger()`. Der Scan ist
   sauber, die einzige Eigenheit ist, dass der Betrag auf der ersten Zeile
@@ -337,7 +344,11 @@ falsche oder erfundene Zahlen zu liefern.
     PDF, auch mehrfach pro Seite bei mehreren Teiltabellen) - funktioniert
     für die meisten Versicherer ohne Anpassung, inkl. Mannheimer (mit einer
     Blacklist für Buchungsart-Label wie "Bestandspflege", die sonst als
-    Kundenname missverstanden würden),
+    Kundenname missverstanden würden). Der Betrag in der Betragsspalte wird
+    von rechts nach links gesucht (erstes als Zahl parsebares Wort), nicht
+    nur in den letzten ein/zwei Wörtern - manche Abrechnungen (z.B.
+    Blaudirekt) hängen sonst noch einen Hinweis wie "Festbetrag" nach dem
+    Betrag an, der die Zeile sonst fälschlich verworfen hätte,
   - einen eigenen Parser für Block-Formate ohne Tabellenkopf: Fondsfinanz und
     Swiss Life ("VN/VP Name ... Summe Vertrag X"),
   - einen eigenen Parser für VHV (dort steht die Name+Adresse-Zeile nach den
