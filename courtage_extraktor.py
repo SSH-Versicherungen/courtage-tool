@@ -1720,6 +1720,14 @@ def find_dialog_total_hint(pdf):
 # ausgeschlossen werden.
 OCR_UNRELIABLE_INSURERS = ["dialog"]
 
+# Versicherer, die ihre Betragsspalte aus ihrer eigenen Soll/Haben-Sicht
+# drucken statt aus Maklersicht - ein bei ihnen negativer Betrag ist fuer
+# SSH eine Gutschrift und umgekehrt (Nutzer-Bestaetigung fuer Hiscox/
+# Mannheimer, urspruenglich bei AIG anhand der aufgedruckten Summenzeile
+# "...zu Ihren Gunsten..." entdeckt). Siehe SIGN_INVERTED_INSURERS-Nutzung
+# in process_file().
+SIGN_INVERTED_INSURERS = {"aig", "hiscox", "mannheimer"}
+
 
 def insurer_name_from_filename(filename, month_folder):
     base = os.path.splitext(os.path.basename(filename))[0]
@@ -1926,13 +1934,14 @@ def process_file(filepath, month_folder):
 
             pages_words.append((pidx, words, source))
 
-        if insurer_lower == "aig":
-            # AIG druckt die Provisions-/Courtage-Spalte grundsaetzlich mit
-            # nachgestelltem Minus, auch wenn der Betrag "zu Ihren Gunsten"
-            # (siehe Summenzeile "Summe Vermittler (Provision/Courtage zu
-            # Ihren Gunsten): ... 112,39-") tatsaechlich eine Gutschrift fuer
-            # den Makler ist - umgekehrte Vorzeichenlogik zu allen anderen
-            # Versicherern. Vorzeichen daher explizit umdrehen.
+        if insurer_lower in SIGN_INVERTED_INSURERS:
+            # AIG, Hiscox und Mannheimer drucken ihre Betragsspalte aus Sicht
+            # des Versicherers (dessen eigenes Soll/Haben), nicht aus Sicht
+            # von SSH als Makler - ein beim Versicherer negativer Saldo ist
+            # fuer uns eine Gutschrift und umgekehrt (Nutzer-Bestaetigung).
+            # Bei AIG zusaetzlich explizit belegt durch die Summenzeile
+            # "Summe Vermittler (Provision/Courtage zu Ihren Gunsten): ...
+            # 112,39-". Vorzeichen daher fuer alle drei explizit umdrehen.
             rows = [(p, k, -amt, l, s) for (p, k, amt, l, s) in extract_generic_table(pages_words)]
         elif "alte-leipziger" in insurer_lower:
             rows = extract_alte_leipziger(pages_words)
@@ -1959,7 +1968,7 @@ def process_file(filepath, month_folder):
             rows = extract_generic_table(pages_words)
 
         total_hint = find_total_in_text(full_text)
-        if total_hint is not None and insurer_lower == "aig":
+        if total_hint is not None and insurer_lower in SIGN_INVERTED_INSURERS:
             total_hint = -total_hint
         if not full_text.strip() and used_ocr:
             ocr_text_parts = []
