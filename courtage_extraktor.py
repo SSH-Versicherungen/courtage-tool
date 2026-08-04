@@ -124,10 +124,16 @@ AMOUNT_EXCLUDE = ["%", "satz", "-satz", "erwart"]
 BLACKLIST_LINE_KEYWORDS = [
     "summe", "saldo", "gesamt", "endsaldo", "kontostand", "uebertrag",
     "vortrag", "zwischensumme", "kontenstand",
-    "auszahlungsbetrag", "stornoreserve", "abrechnungsbetrag",
+    "auszahlungsbetrag", "abrechnungsbetrag",
     "seite", "kontoauszug", "davon", "total", "bezeichnung",
     "jahreswerte", "zahlungsausgang",
 ]
+# "stornoreserve" bewusst NICHT (mehr) auf der Sperrliste: bei Fondsfinanz
+# (eigener Parser, siehe extract_fondsfinanz) spielt das ohnehin keine
+# Rolle, aber bei anderen Versicherern (z.B. Blaudirekt) ist eine
+# "Stornoreserve"-Zeile ein echter, vertragsbezogener Abzug/Zuschlag, der
+# dem jeweiligen Kunden gutzuschreiben ist (Nutzer-Bestaetigung), nicht
+# eine rein informative Sammel-Zwischensumme.
 # Nur DIESE (Teilmenge der Blacklist) setzen den "aktuellen Kunden" auch
 # zurueck, statt die Zeile nur zu ueberspringen: sie markieren ein echtes
 # Abschnittsende (z.B. eine Spaltenkopf-Wiederholung wie "VGART Bezeichnung
@@ -503,9 +509,23 @@ def extract_generic_table(pages_words):
             if abs(amount_val) > MAX_PLAUSIBLE_AMOUNT:
                 continue
 
+            # Erlaeuterungstext einer Fortsetzungszeile ohne eigenen Kunden-
+            # namen (z.B. "Stornoreserve 10%" oder "Vertrauensschaden-
+            # haftpflicht" bei einem vertragsbezogenen Abzug/Zuschlag) landet
+            # manchmal in derselben Spalte wie der Betrag selbst, statt in
+            # other_words - z.B. "-4,86 EUR Stornoreserve" mit x0 noch
+            # innerhalb der Betragsspalte. Nur "EUR"/"€" und das erkannte
+            # Betragswort selbst gelten als reine Fuellwoerter ohne
+            # Aussagekraft.
+            extra_amount_words = [
+                w for w in amount_words
+                if parse_amount(w["text"]) is None and normalize(w["text"]) not in ("eur", "€")
+            ]
+            has_context = bool(other_words) or bool(extra_amount_words)
+
             if name_text:
                 rows.append((page_idx, current_customer, amount_val, line_text, source))
-            elif other_words:
+            elif has_context:
                 if current_customer:
                     rows.append((page_idx, current_customer, amount_val, line_text, source))
             # reine Zahlen-Zeile ohne sonstigen Inhalt -> Zwischensumme, skip
