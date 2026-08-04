@@ -858,13 +858,18 @@ def extract_axa(pdf):
     einzelnen Sparten-Teilbetraege), sonst wuerde doppelt gezaehlt.
 
     Auf der letzten Seite folgt zusaetzlich ein 'ALLGEMEINE UMSAETZE
-    VD-KONTO'-Abschnitt mit kontobezogenen (nicht kundenbezogenen)
-    Buchungen wie 'Kontoausgleich' oder 'Umbuchung' - diese enden zwar
-    ebenfalls auf 'VD', haben aber keinen vorausgehenden echten
-    'VN:'-Kundenblock und werden daher ueber current_name=None
-    ausgeschlossen. Verifiziert: die Summe der Kundenbloecke stimmt bei
-    allen 3 getesteten Juni-2026-Dateien exakt mit der im PDF selbst
-    aufgedruckten 'Betreu.-prov.'-Kontrollsumme ueberein."""
+    VD-KONTO'-Abschnitt mit kontobezogenen Buchungen. Darunter sind zwei
+    Faelle zu unterscheiden (Nutzer-Bestaetigung anhand eines echten
+    Beispiels): eine reine 'Kontoausgleich'-Buchung (z.B. eine Auszahlung/
+    Ueberweisung durch AXA) ist tatsaechlich nicht kundenbezogen und wird
+    ausgeschlossen - eine 'Umbuchung ... Prov.-Ausgleich'-Buchung dagegen
+    IST einem Kunden zuzurechnen, auch wenn ihr (anders als bei einem
+    echten Kundenblock) keine 'VN:'-Zeile vorausgeht, sondern eine mit dem
+    Namen verschmolzene Referenzzeile ('VN:Name') NACH der Betragszeile
+    folgt. Ein solcher noch nicht zugeordneter Betrag wird daher als
+    'pending' zwischengespeichert und, falls direkt danach eine
+    'VN:Name'-Referenzzeile folgt, diesem Kunden zugerechnet - andernfalls
+    (z.B. beim reinen Kontoausgleich ohne jede Namensreferenz) verworfen."""
     rows = []
     for page_idx, page in enumerate(pdf.pages):
         words = page.extract_words()
@@ -878,27 +883,38 @@ def extract_axa(pdf):
         lines = [sorted(groups[k], key=lambda w: -w["top"]) for k in sorted(groups.keys())]
 
         current_name = None
+        pending = None  # (amt, line_text) ohne current_name - evtl. gleich per "VN:Name"-Referenzzeile zuzuordnen
         for line in lines:
             texts = [w["text"] for w in line]
             # Nur der EXAKTE Token "VN:" zaehlt als Start eines echten
-            # Kundenblocks. In der "ALLGEMEINE UMSAETZE"-Sektion (letzte
-            # Seite) kommt gelegentlich ein mit dem Namen verschmolzenes
-            # "VN:Name" als blosser Referenzhinweis auf einer allgemeinen,
-            # nicht kundenspezifischen Kontobuchung vor (z.B. "Kontoaus-
-            # gleich") - wuerde bei Erkennung faelschlich current_name
-            # setzen und diese Buchung so einem Kunden zurechnen.
+            # Kundenblocks.
             if AXA_VN_MARKER in texts:
                 vn_idx = texts.index(AXA_VN_MARKER)
                 name_toks = texts[vn_idx + 1:vn_idx + 3]
                 current_name = " ".join(name_toks).replace(",", "").strip()
+                pending = None
+                continue
+            if len(texts) == 1 and texts[0].startswith(AXA_VN_MARKER):
+                # Verschmolzene Referenzzeile "VN:Name" (siehe Docstring) -
+                # loest einen zwischengespeicherten "pending"-Betrag auf.
+                if pending:
+                    ref_name = texts[0][len(AXA_VN_MARKER):].strip()
+                    amt, line_text = pending
+                    if ref_name:
+                        rows.append((page_idx, ref_name, amt, line_text, "text"))
+                    pending = None
                 continue
             if texts and texts[-1] == "VD" and len(texts) >= 4:
                 amt_tok, flag_tok = texts[-3], texts[-2]
-                if ALLIANZ_NUM_RE.match(amt_tok) and flag_tok in ("H", "S") and current_name:
+                if ALLIANZ_NUM_RE.match(amt_tok) and flag_tok in ("H", "S"):
                     sign = 1 if flag_tok == "H" else -1
-                    amt = sign * parse_amount(amt_tok)
+                    amt = round(sign * parse_amount(amt_tok), 2)
                     line_text = " ".join(texts)
-                    rows.append((page_idx, current_name, round(amt, 2), line_text, "text"))
+                    if current_name:
+                        rows.append((page_idx, current_name, amt, line_text, "text"))
+                        pending = None
+                    else:
+                        pending = (amt, line_text)
     return rows
 
 
@@ -1395,6 +1411,7 @@ MANUAL_BETREUER_OVERRIDES_RAW = {
     "Calhanoglu Muhammed": "Robin Heckmann",
     "Rieker Anagbogu": "Robin Heckmann",  # Elvira Rieker Anagbogu
     "Rosen Adrian": "Robin Heckmann",  # in CRM als inaktiv markiert, aber aktiv
+    "Rosen": "Robin Heckmann",  # bloss "Rosen" (ohne Vorname) auf AXA-Umbuchungszeilen - derselbe Kunde
     "Dos Santos Card": "Robin Heckmann",  # Paulo Dos Santos Cardoso
     "Die Peperonis Heddesh": "Robin Heckmann",  # Die Peperonis Heddesheim Inh. Tuerkmen & Dornsbach
     "Pension Wohlgelegen": "Tim Selle",  # Pension Wohlgelegen Natascha San Miguel Teran
