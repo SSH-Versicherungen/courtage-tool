@@ -1961,6 +1961,14 @@ def process_file(filepath, month_folder):
                 # damit diese Betraege nicht dem falschen Monat zugerechnet
                 # werden. Bei gescannten Seiten (kein Text-Layer) aus den
                 # ersten OCR-Woertern rekonstruieren.
+                #
+                # WICHTIG: "Erstellungsdatum:" eignet sich NICHT fuer diesen
+                # Zweck (Versuch verworfen) - bei Alte Leipziger steht auf
+                # ALLEN Seiten eines mehrseitigen Sammel-Scans dasselbe
+                # Erstellungsdatum (Druckdatum des gesamten Stapels, oft
+                # erst Anfang des Folgemonats), unabhaengig vom tatsaechlichen
+                # Buchungsdatum der einzelnen Positionen - haette sonst ganze
+                # Dateien faelschlich auf 0 gefiltert.
                 period_text = page_full_text[:300]
                 if not period_text.strip():
                     period_text = " ".join(w["text"] for w in words[:100])
