@@ -1,8 +1,11 @@
 # Standardeinstellungen fuer "streamlit run app.py":
-# Nur auf localhost erreichbar (nicht im Netzwerk/Internet sichtbar) -
-# die verarbeiteten PDFs enthalten Kunden- und Provisionsdaten.
+# Im Netzwerk erreichbar (nicht nur localhost), damit Mitarbeiter auf dem
+# gemeinsamen WTS von ihrem jeweiligen Rechner aus zugreifen koennen - siehe
+# .streamlit/secrets.toml (app_password), das ist der Grund, warum das
+# vertretbar ist: ohne Passwort waeren die verarbeiteten Kunden-/
+# Provisionsdaten sonst fuer jeden im Netzwerk sichtbar.
 [server]
-address = "127.0.0.1"
+address = "0.0.0.0"
 headless = true
 
 [browser]

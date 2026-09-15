@@ -46,10 +46,11 @@ from collections import Counter
 
 import pdfplumber
 import pandas as pd
+import numpy as np
 
 try:
     import pytesseract
-    from PIL import ImageOps
+    from PIL import ImageOps, ImageFilter
     TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(TESSERACT_EXE):
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
@@ -77,6 +78,11 @@ TOOL_DIR = os.path.dirname(os.path.abspath(__file__))                   # .../Um
 NAME_KEYWORDS_STRONG = [
     "versicherungsnehmer", "kunde", "name, vorname", "vertragsinhaber",
     "versicherter", "name vn", "mandant",
+    # "Vers.-nehmer" (z.B. Ergo) - abgekuerzte Schreibweise von
+    # "Versicherungsnehmer", die von "versicherungsnehmer" (voll ausgeschrieben)
+    # und "versicherungs-" (WEAK, kollidiert mit "Versicherungs-Nr.") nicht
+    # erfasst wird.
+    "vers.-nehmer",
 ]
 # Tier 2: nur als Fallback, wenn Tier 1 nichts findet (z.B. Kopfzeile ueber
 # zwei Zeilen gebrochen: "Versicherungs-" / "nehmer"). "versicherungs-"
@@ -127,6 +133,16 @@ BLACKLIST_LINE_KEYWORDS = [
     "auszahlungsbetrag", "abrechnungsbetrag",
     "seite", "kontoauszug", "davon", "total", "bezeichnung",
     "jahreswerte", "zahlungsausgang",
+    # "Auszahlung" pauschal (nicht nur "auszahlungsbetrag"): faengt u.a. die
+    # Amex-Pool-Zeile "Sonstige Positionen" / "<Datum> Auszahlung freie
+    # Stornoreserve <Betrag>" ab, die extract_generic_table sonst mit den
+    # zuletzt erkannten (nicht mehr passenden) Spaltenbreiten der
+    # vorangegangenen Tabelle als Muell-"Kundenzeile" einliest - der
+    # eigentliche Betrag wird stattdessen sauber ueber
+    # extract_amex_stornoreserve_auszahlung() erfasst.
+    "auszahlung",
+    # Fusszeile "Abrechnung vom <Datum>" (z.B. Amex-Pool) - kein Kunde.
+    "abrechnung vom",
 ]
 # "stornoreserve" bewusst NICHT (mehr) auf der Sperrliste: bei Fondsfinanz
 # (eigener Parser, siehe extract_fondsfinanz) spielt das ohnehin keine
@@ -330,10 +346,25 @@ def _find_name_and_amount(combined_words):
     Woertern nicht beides eindeutig vorkommt. Nutzt zuerst die eindeutigen
     (Tier-1) Namens-Schluesselwoerter, erst danach die mehrdeutigeren
     Tier-2-Woerter (die z.B. mit 'Versicherungs-Nr.' kollidieren koennen)."""
+    def next_word_is_satz(word):
+        # "Prov." + "Satz" als ZWEI getrennte Woerter (z.B. Domcura:
+        # "Prov. in % ... Prov. Satz" ueber zwei Zeilen gebrochener
+        # Tabellenkopf) ist eine Provisionssatz-/Prozent-Spalte, keine
+        # Betragsspalte - als EIN Wort ("Provisionssatz") faengt bereits
+        # AMOUNT_EXCLUDE ("satz" als Teilstring) das ab, hier zusaetzlich
+        # fuer den Fall zweier getrennter Woerter in derselben Zeile.
+        same_line = [w for w in combined_words if w["_line"] == word["_line"] and w is not word]
+        after = [w for w in same_line if w["x0"] > word["x0"]]
+        if not after:
+            return False
+        nxt = min(after, key=lambda w: w["x0"])
+        return normalize(nxt["text"]).startswith("satz")
+
     amount_candidates = [
         w for w in combined_words
         if matches_any(normalize(w["text"]), AMOUNT_KEYWORDS)
         and not matches_any(normalize(w["text"]), AMOUNT_EXCLUDE)
+        and not next_word_is_satz(w)
     ]
     if not amount_candidates:
         return None
@@ -521,7 +552,19 @@ def extract_generic_table(pages_words):
                 w for w in amount_words
                 if parse_amount(w["text"]) is None and normalize(w["text"]) not in ("eur", "€")
             ]
-            has_context = bool(other_words) or bool(extra_amount_words)
+            # other_words muss ECHTEN Erlaeuterungstext enthalten, um eine
+            # Fortsetzungszeile zu erkennen - eine reine Tabellen-Zwischen-
+            # summe ohne Textlabel (z.B. Amex-Pool: "1.846,76 115,48" als
+            # letzte Zeile einer Kundentabelle, N-Praemie- und Courtage-
+            # Spaltensumme ohne "Summe"-Wort) faellt sonst in other_words
+            # (die N-Praemie-Zahl liegt ausserhalb von Name-/Betragsspalte)
+            # und wuerde faelschlich als weitere Buchungszeile des zuletzt
+            # gesehenen Kunden gezaehlt (doppelt gezaehlte Spaltensumme).
+            meaningful_other_words = [
+                w for w in other_words
+                if parse_amount(w["text"]) is None and normalize(w["text"]) not in ("eur", "€")
+            ]
+            has_context = bool(meaningful_other_words) or bool(extra_amount_words)
 
             if name_text:
                 rows.append((page_idx, current_customer, amount_val, line_text, source))
@@ -654,20 +697,77 @@ def extract_swiss_life_vsv_deduction(pages_full_text):
     return None
 
 
+AMEX_STORNORESERVE_AUSZAHLUNG_RE = re.compile(
+    r"\d{2}\.\d{2}\.\d{4}\s+Auszahlung\s+freie\s+Stornoreserve\s+([\d.,]+)"
+)
+
+
+def extract_amex_stornoreserve_auszahlung(pages_full_text):
+    """Amex-Pool: manuell angestossene Auszahlung einer 'freien Stornoreserve'
+    steht als eigene Zeile im Abschnitt 'Sonstige Positionen', z.B.
+    '17.08.2026 Auszahlung freie Stornoreserve 1898,39'. Lebensversicherungs-
+    Provisionen werden bei SSH bereits vollstaendig (inkl. des einbehaltenen
+    Stornoreserve-Anteils) beim urspruenglichen Buchungsdatum verbucht und
+    einem Kunden/Partner zugeordnet - die spaetere Auszahlung der Reserve
+    betrifft rueckwirkend viele verschiedene, nicht mehr einzeln nachvoll-
+    ziehbare Kunden (Nutzer-Bestaetigung) und wird daher als eigene, mit
+    NICHT_ZUORDENBAR_MARKER gekennzeichnete Zeile ohne Kunden-/Betreuer-
+    Zuordnung zurueckgegeben (siehe process_file(), apply_betreuer())."""
+    for pidx, text in pages_full_text:
+        m = AMEX_STORNORESERVE_AUSZAHLUNG_RE.search(text)
+        if m:
+            amt = parse_amount(m.group(1))
+            if amt:
+                return pidx, amt, m.group(0)
+    return None
+
+
 VHV_ADDR_RE = re.compile(r"^(.+?),\s*.+?,\s*\d{5}\s+\S")
+
+# Links von der Name/Adresse-Spalte (beginnt konstant bei x0 ~165) steht bei
+# VHV eine eigene, schmale Spalte (x0 ~77-95) mit einem internen Kuerzel -
+# mal eine Kundengruppen-/Sparten-Nummer (z.B. "3374"), mal ein
+# Vermittler-Kuerzel ("TS"/"RH"/"AS"). cluster_lines() gruppiert beides in
+# dieselbe Zeile wie den Namen, da rein visuell (gleiche Zeilenhoehe)
+# nicht unterscheidbar - ohne Filterung landet das Kuerzel als Praefix im
+# extrahierten Kundennamen (z.B. "TS Boris Eichhorn" statt "Boris Eichhorn")
+# und die Namenszuordnung zu Betreuer.xlsx schlaegt fehl. Schwellwert 120
+# liegt sicher zwischen beiden Spalten (Kuerzel-Spalte endet bei ca. 95,
+# Name-Spalte beginnt bei ca. 165).
+VHV_NAME_COLUMN_X0_MIN = 120
+
+# Am Ende jeder Abrechnungsgruppe druckt VHV eine Sparten-Aufschluesselung
+# ("10 Haftpflicht 51,32 12,84" / "20 KFZ VHV Allgemeine 8.853,06 622,78" /
+# "60 Sachversicherungen 49,57 12,40") gefolgt von "Gesamtsumme ...". Die
+# Gesamtsumme-Zeile selbst ist bereits blacklisted (siehe
+# BLACKLIST_LINE_KEYWORDS), die "20 KFZ ..."-Zeile davor aber nicht - sie hat
+# zufaellig >=6 Tokens und endet auf einen gueltigen Betrag, wuerde also als
+# Buchungszeile in "pending" landen. Bisher beobachtet nur am Ende der
+# jeweils letzten Seite einer Gruppe (kein nachfolgender Adresstreffer mehr,
+# daher folgenlos), aber sicherheitshalber hier explizit ausgeschlossen -
+# nur fuer VHV, nicht global (die Woerter koennten bei anderen Versicherern
+# legitim in einer Kundenzeile vorkommen).
+VHV_SPARTE_RECAP_WORDS = ("haftpflicht", "sachversicherungen", "kfz")
 
 
 def extract_vhv(pages_words):
     """VHV: 1-3 Buchungszeilen (Betrag als letztes Feld) stehen VOR der
     zugehoerigen Zeile 'Firma/Name, Strasse , PLZ Ort' - nicht danach wie
     bei den meisten anderen Versicherern. Die gepufferten Betraege werden
-    rueckwirkend der folgenden Name+Adresse-Zeile zugeordnet."""
+    rueckwirkend der folgenden Name+Adresse-Zeile zugeordnet. 'pending' wird
+    bewusst NICHT pro Seite zurueckgesetzt, sondern nur pro Datei: manche
+    Kundenbloecke (Storno + Neubuchung, oft mehrere Buchungszeilen) enden
+    exakt am Seitenende, die zugehoerige Name+Adresse-Zeile folgt dann erst
+    als allererste Zeile der naechsten Seite - ein Reset pro Seite wuerde
+    diese Betraege sonst stillschweigend verwerfen (beobachtet bei
+    August-2026: 'Nazim Turan', 12 am Ende von Seite 8 gepufferte Zeilen,
+    Summe -13,82 EUR, gingen so komplett verloren)."""
     rows = []
+    pending = []
     for page_idx, words, source in pages_words:
         if not words:
             continue
         lines = cluster_lines(words)
-        pending = []
         for line in lines:
             toks = [w["text"] for w in line["words"]]
             if not toks:
@@ -675,18 +775,108 @@ def extract_vhv(pages_words):
             line_text = " ".join(toks)
             m = VHV_ADDR_RE.match(line_text)
             if m:
-                name = line_text.split(",")[0].strip()
+                name_toks = [w["text"] for w in line["words"] if w["x0"] >= VHV_NAME_COLUMN_X0_MIN]
+                name = (" ".join(name_toks) if name_toks else line_text).split(",")[0].strip()
                 for amt, ltxt in pending:
                     rows.append((page_idx, name, amt, ltxt, source))
                 pending = []
                 continue
             if is_blacklisted_line(line_text.lower()):
-                pending = []
+                # Nur bei einer ECHTEN Abschnittsende-Zeile (Gesamtsumme/
+                # Zwischensumme) den Puffer verwerfen - eine reine Seiten-
+                # fusszeile wie "Seite 3 von 6" (blacklisted wegen "seite")
+                # darf laufende Buchungen NICHT loeschen, sonst gehen genau
+                # die Faelle verloren, die schon den Seitenumbruch-Fix oben
+                # noetig gemacht haben (die Fusszeile steht nach den letzten
+                # Buchungszeilen, aber vor der Adresszeile auf der naechsten
+                # Seite).
+                if any(k in line_text.lower() for k in ("summe", "gesamt")):
+                    pending = []
+                continue
+            if any(w in line_text.lower() for w in VHV_SPARTE_RECAP_WORDS):
                 continue
             if len(toks) >= 6:
                 amt = parse_amount(toks[-1])
                 if amt is not None and abs(amt) <= MAX_PLAUSIBLE_AMOUNT:
                     pending.append((amt, line_text))
+    return rows
+
+
+DOMCURA_POLICY_RE = re.compile(r"^[A-Z]{2,6}-\d+-\d+$")
+
+
+def extract_domcura(pages_words):
+    """Domcura-Einzelaufstellung: jede Buchungszeile beginnt mit einem
+    Policennummer-Kuerzel (z.B. 'IDCPT-03-1012980', 'DCDO-94-2078570'),
+    gefolgt vom Kundennamen bis zum naechsten festen Schluesselwort
+    'DOMCURA' (Produktbezeichnung), und endet mit dem Provisionsbetrag
+    direkt vor einem kurzen Vergluetungsart-Kuerzel (z.B. 'FP', 'AP') -
+    NICHT dem vorherigen 'Nettobetrag', der ebenfalls im selben Format
+    dasteht. Die zugehoerige Adress-/VP-Folgezeile (z.B. 'Vinh Duc D-67240
+    ... 0,00 %') beginnt nicht mit einem Policennummer-Kuerzel und wird
+    dadurch automatisch uebersprungen - ebenso die abschliessenden
+    'Zwischensumme'/'Zusammenfassung'/'Gesamtbetrag'-Rekapitulationszeilen,
+    die den generischen Tabellen-Parser hier faelschlich als zusaetzliche
+    Kundenzeile einlesen wuerden (kein Blacklist-Wort wie 'summe'/'gesamt'
+    in der Zeile 'Sachversicherung 190,35 €' der Zusammenfassung)."""
+    rows = []
+    for page_idx, words, source in pages_words:
+        if not words:
+            continue
+        lines = cluster_lines(words)
+        for line in lines:
+            toks = [w["text"] for w in line["words"]]
+            if not toks or not DOMCURA_POLICY_RE.match(toks[0]):
+                continue
+            if "DOMCURA" not in toks:
+                continue
+            name_idx = toks.index("DOMCURA")
+            name = " ".join(toks[1:name_idx]).strip(" ,")
+            amt = None
+            for t in reversed(toks):
+                amt = parse_amount(t)
+                if amt is not None:
+                    break
+            if amt is not None and name:
+                rows.append((page_idx, name, amt, " ".join(toks), source))
+    return rows
+
+
+ERGO_ART_CODES = ("AP", "BP")
+
+
+def extract_ergo(pages_words):
+    """Ergo 'Verguetungsnachweis': jede Buchungszeile beginnt mit einem
+    Verguetungsart-Kuerzel ('AP' Abschlussprovision oder 'BP'
+    Bestandsprovision), gefolgt vom Kundennamen - mal als EIN Token
+    ('Nachname,Vorname'), mal als ZWEI Token ('Nachname Vorname') ohne
+    Komma, uneinheitlich sogar fuer denselben Kunden innerhalb derselben
+    Datei (z.B. 'Gerszewski Christine' und 'Gerszewski,Christine'). Der
+    Provisionsbetrag steht immer als letztes Token der Zeile. Der
+    zweizeilige Tabellenkopf ('Verg.-art Vers.-nehmer ... / VNR Grund ...')
+    sowie die 'AP/BP Provisionsvertrags-Nr: <N>'-Zwischenzeilen werden
+    automatisch ausgeschlossen (zu wenige Tokens bzw. keine gueltige
+    Betragszahl am Ende)."""
+    rows = []
+    for page_idx, words, source in pages_words:
+        if not words:
+            continue
+        lines = cluster_lines(words)
+        for line in lines:
+            toks = [w["text"] for w in line["words"]]
+            if len(toks) < 5 or toks[0] not in ERGO_ART_CODES:
+                continue
+            if "," in toks[1]:
+                name = toks[1]
+            elif re.fullmatch(r"[A-Za-zÀ-ÿ.\-]+", toks[2]):
+                name = toks[1] + " " + toks[2]
+            else:
+                name = toks[1]
+            name = name.rstrip(",").strip()
+            amt = parse_amount(toks[-1])
+            if amt is None or abs(amt) > MAX_PLAUSIBLE_AMOUNT:
+                continue
+            rows.append((page_idx, name, amt, " ".join(toks), source))
     return rows
 
 
@@ -1229,6 +1419,198 @@ def extract_barmenia(pdf):
     return rows
 
 
+# Spalten-x-Bereiche (PDF-Punkte) fuer extract_barmenia_laufende() - relativ
+# stabil ueber alle "Laufende & Folgeprovisionen"-Seiten desselben Vorlagen-
+# Formats: die Kopfzeilen-Woerter "Versicherungs-/nehmer" sitzen konstant bei
+# x0~28-46, "Vergütungs-/betrag ... EUR" konstant bei x0~496-617 (siehe
+# extract_barmenia_laufende()-Docstring fuer die Herleitung). Nicht dynamisch
+# aus der Kopfzeile abgeleitet (waere robuster gegen Layout-Aenderungen in
+# kuenftigen Monaten), sondern fest verdrahtet - wie bei VHV_NAME_COLUMN_X0_MIN
+# ein bewusster Kompromiss fuer diese eine Vorlage.
+BARMENIA_LAUFENDE_NAME_X = (10, 133)
+BARMENIA_LAUFENDE_AMOUNT_X = (596, 674)
+BARMENIA_LAUFENDE_AMT_ATTEMPTS = (
+    (8, 6), (3, 6), (0, 6), (3, 4), (0, 4), (3, 7), (0, 7), (12, 6), (5, 3),
+)
+BARMENIA_LAUFENDE_NAME_ATTEMPTS = ((3, 4), (0, 4), (0, 6), (3, 6), (0, 7), (3, 3), (8, 4))
+BARMENIA_LAUFENDE_NAME_RE = re.compile(
+    r"[A-Za-zÀ-ÿ]{2,}[A-Za-zÀ-ÿ.\-]*,\s*[A-Za-zÀ-ÿ]{2,}[A-Za-zÀ-ÿ.\-]*"
+)
+BARMENIA_LAUFENDE_AMT_RE = re.compile(r"-?\d{1,3}(?:\.\d{3})*,\d{2}")
+
+
+def _barmenia_laufende_row_bands(im, resolution):
+    """Erkennt Tabellenzeilen-Grenzen ueber horizontale schwarze Linien im
+    Pixelraster der Betragsspalte (siehe extract_barmenia_laufende())."""
+    scale = resolution / 72.0
+    x0, x1 = int(BARMENIA_LAUFENDE_AMOUNT_X[0] * scale), int(BARMENIA_LAUFENDE_AMOUNT_X[1] * scale)
+    arr = np.array(im.convert("L"))
+    strip = arr[:, x0:x1]
+    dark_frac = (strip < 128).mean(axis=1)
+    line_rows = np.where(dark_frac > 0.8)[0]
+    lines = []
+    if len(line_rows):
+        start = prev = line_rows[0]
+        for r in line_rows[1:]:
+            if r - prev > 3:
+                lines.append((start + prev) // 2)
+                start = r
+            prev = r
+        lines.append((start + prev) // 2)
+    return [(lines[i], lines[i + 1]) for i in range(len(lines) - 1) if 60 <= lines[i + 1] - lines[i] <= 250]
+
+
+def extract_barmenia_laufende(pdf):
+    """Barmenia 'Verguetungsnachweis Laufende & Folgeprovisionen' (gescannt,
+    andere Tabellenvorlage als die Abschlussverguetungen-Seiten in
+    extract_barmenia()): eine dicht gedruckte mehrspaltige Tabelle mit
+    sichtbaren Zellrahmen. Der Standard-OCR-Pfad (ganze Seite als Fliesstext,
+    egal ob --psm 6 oder automatische Wort-Erkennung) liefert dafuer nur
+    Bildrauschen - NICHT weil der Scan schlecht waere (eine einzelne isolierte
+    Tabellenzelle liest sich einwandfrei), sondern weil Tesseracts Seiten-
+    /Spaltenerkennung an der dichten Tabelle scheitert.
+
+    Workaround: die Tabellenzeilen-Grenzen werden direkt aus den Pixeln
+    erkannt (durchgehende dunkle horizontale Linien in der Betragsspalte,
+    siehe _barmenia_laufende_row_bands()), dann wird JEDE Zeile fuer sich
+    zugeschnitten und Name-/Betragsspalte getrennt per OCR gelesen (mehrere
+    Zuschnitt-/PSM-Kombinationen werden probiert, bis eine einen gueltigen
+    Betrag bzw. ein Name-Komma-Name-Muster liefert). Das behebt das
+    Segmentierungsproblem, da jede einzelne Zelle klein/isoliert genug ist.
+
+    Nicht 100% zuverlaessig: manche Zeilen liefern trotzdem keinen gueltigen
+    Betrag (werden dann uebersprungen - fehlendes Geld, kein Risiko), und
+    einzelne erkannte Namen koennen leicht verlesen sein (z.B. ein Buchstabe
+    falsch). Das ist bewusst in Kauf genommen, WEIL match_betreuer() ein
+    Sicherheitsnetz bietet: ein verlesener Name matcht in aller Regel keinen
+    (falschen) Betreuer.xlsx-Eintrag und landet stattdessen im Blatt
+    'Kunde_ohne_Betreuer' zur manuellen Pruefung, statt still einem falschen
+    Kunden/Partner zugerechnet zu werden."""
+    rows = []
+    for pidx, page in enumerate(pdf.pages):
+        if len(page.chars) > 0:
+            continue
+        quick_text = pytesseract.image_to_string(page.to_image(resolution=200).original, lang="deu").lower()
+        if "laufende" not in quick_text or "folgeprovision" not in quick_text:
+            continue
+        resolution = 400
+        im = page.to_image(resolution=resolution).original
+        scale = resolution / 72.0
+        name_x0, name_x1 = (int(v * scale) for v in BARMENIA_LAUFENDE_NAME_X)
+        amt_x0, amt_x1 = (int(v * scale) for v in BARMENIA_LAUFENDE_AMOUNT_X)
+
+        for top, bottom in _barmenia_laufende_row_bands(im, resolution):
+            amt = None
+            for pad, psm in BARMENIA_LAUFENDE_AMT_ATTEMPTS:
+                crop = im.crop((amt_x0, max(0, top - pad), amt_x1, bottom + pad))
+                text = pytesseract.image_to_string(crop, lang="deu", config=f"--psm {psm}").strip()
+                m = BARMENIA_LAUFENDE_AMT_RE.search(text)
+                if m:
+                    amt = parse_amount(m.group(0))
+                    break
+            if amt is None or abs(amt) > MAX_PLAUSIBLE_AMOUNT:
+                continue
+
+            name = None
+            raw_name_text = ""
+            for pad, psm in BARMENIA_LAUFENDE_NAME_ATTEMPTS:
+                crop = im.crop((name_x0, max(0, top - pad), name_x1, bottom + pad))
+                text = pytesseract.image_to_string(crop, lang="deu", config=f"--psm {psm}").strip()
+                m = BARMENIA_LAUFENDE_NAME_RE.search(text)
+                if m:
+                    name = m.group(0).strip()
+                    raw_name_text = text
+                    break
+            if not name:
+                continue
+
+            rows.append((pidx, name, amt, raw_name_text, "ocr"))
+    return rows
+
+
+# Wie BARMENIA_LAUFENDE_NAME_X/AMOUNT_X: PDF-Punkte-Bereiche fuer die
+# 'Kunde'- und 'Prov./Court'-Spalte des Dialog-'Provisionseinzelnachweis'
+# (siehe extract_dialog()), per Sichtpruefung ermittelt.
+DIALOG_NAME_X = (133, 227)
+DIALOG_AMOUNT_X = (693, 774)
+DIALOG_AMT_RE = re.compile(r"-?\d{1,3}(?:\.\d{3})*,\d{2}")
+DIALOG_NAME_RE = re.compile(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.&\- ]{2,}")
+
+
+def extract_dialog(pages):
+    """Dialog 'Provisionseinzelnachweis' (gescannt): pro Kunde ein zwei-
+    zeiliger Tabellenblock (Name ueber 1-2 Zeilen, dann Prov.Satz/Prov.-
+    Betrag uebereinander in derselben Zelle) mit sichtbarem gepunkteten/
+    gestreiften Wasserzeichen-Hintergrund im gesamten Tabellenbereich -
+    dieser Hintergrund verwirrt sowohl Tesseracts Standard-Volltext-OCR
+    (--psm 6) als auch die wortpositionsbasierte OCR (image_to_data findet
+    auf einer Seite nur ~20 statt ~180 Woerter) fast vollstaendig, obwohl
+    der Scan selbst gestochen scharf ist.
+
+    Workaround wie bei extract_barmenia_laufende(): Tabellenzeilen ueber
+    horizontale schwarze Linien im Pixelraster der Betragsspalte finden,
+    dann Name-/Betragsspalte je Zeile einzeln zuschneiden. Zusaetzlich noetig
+    (im Unterschied zu Barmenia): ein Median-Filter auf dem Graustufenbild
+    VOR der OCR entfernt das feine Punktraster, ohne die fetten Text-
+    Konturen zu zerstoeren - ohne ihn bleibt es bei Bildrauschen. In der
+    Betragsspalte stehen Prov.Satz (Prozent) UND Prov.-Betrag (Euro)
+    uebereinander - der gesuchte Betrag ist immer der LETZTE erkannte
+    Dezimalwert der Zeile (Prozentzeichen wird vom OCR manchmal verschluckt,
+    daher kein verlaesslicher Text-Anker).
+
+    Die Detailtabellen-Seite(n) werden NICHT per Text-/OCR-Inhalt erkannt
+    (selbst eine niedrigaufgeloeste Schnellpruefung scheitert am selben
+    Wasserzeichen-Rauschen wie die eigentliche Extraktion), sondern am
+    Seitenformat: die Tabelle steht quer (Breite > Hoehe), waehrend
+    Deckblatt/Uebersichtsseiten hochkant sind."""
+    rows = []
+    for pidx, page in enumerate(pages):
+        if len(page.chars) > 0 or page.width <= page.height:
+            continue
+        resolution = 400
+        im = page.to_image(resolution=resolution).original
+        scale = resolution / 72.0
+        name_x0, name_x1 = (int(v * scale) for v in DIALOG_NAME_X)
+        amt_x0, amt_x1 = (int(v * scale) for v in DIALOG_AMOUNT_X)
+
+        arr = np.array(im.convert("L"))
+        strip = arr[:, amt_x0:amt_x1]
+        dark_frac = (strip < 128).mean(axis=1)
+        line_rows = np.where(dark_frac > 0.7)[0]
+        lines = []
+        if len(line_rows):
+            start = prev = line_rows[0]
+            for r in line_rows[1:]:
+                if r - prev > 3:
+                    lines.append((start + prev) // 2)
+                    start = r
+                prev = r
+            lines.append((start + prev) // 2)
+
+        for i in range(len(lines) - 1):
+            top, bottom = lines[i], lines[i + 1]
+            if not (150 <= bottom - top <= 350):
+                continue
+            amt_crop = im.crop((amt_x0, top, amt_x1, bottom)).convert("L").filter(ImageFilter.MedianFilter(7))
+            amt_text = pytesseract.image_to_string(amt_crop, lang="deu", config="--psm 6")
+            amt_matches = DIALOG_AMT_RE.findall(amt_text)
+            if not amt_matches:
+                continue
+            amt = parse_amount(amt_matches[-1])
+            if amt is None or abs(amt) > MAX_PLAUSIBLE_AMOUNT:
+                continue
+
+            name_crop = im.crop((name_x0, top, name_x1, bottom)).convert("L").filter(ImageFilter.MedianFilter(7))
+            name_text = pytesseract.image_to_string(name_crop, lang="deu", config="--psm 6")
+            m = DIALOG_NAME_RE.search(name_text)
+            if not m:
+                continue
+            name = m.group(0).strip()
+
+            rows.append((pidx, name, amt, name_text.strip(), "ocr"))
+    return rows
+
+
 VEMA_CSV_AMOUNT_COL = "Betrag"
 
 
@@ -1392,9 +1774,9 @@ PARTNER_NAMES = ["Robin Heckmann", "Tim Selle", "Andreas Selle"]
 # Farbcodes je Partner fuer die farbige Markierung in Excel/PDF (Nutzer-
 # Vorgabe: Rot=RH, Gelb=TS, Blau=AS).
 PARTNER_COLORS_XLSX = {
-    "Robin Heckmann": "FFC7CE",
-    "Tim Selle": "FFEB9C",
-    "Andreas Selle": "BDD7EE",
+    "Robin Heckmann": "FFFFC7CE",
+    "Tim Selle": "FFFFEB9C",
+    "Andreas Selle": "FFBDD7EE",
 }
 PARTNER_COLORS_PDF = {
     "Robin Heckmann": (200, 30, 30),
@@ -1443,6 +1825,118 @@ MANUAL_BETREUER_OVERRIDES_RAW = {
     "Van der": "Tim Selle",  # Karin Van der Raaij
     "Stasiak, Alexander": "Tim Selle",  # jetzt Alexander Weickel (Heirat)
     "Erbrecht, Felix": "Robin Heckmann",  # jetzt Felix Aleman (Heirat)
+
+    # August-2026: von Robin manuell hergeleitete Zuordnung fuer Kunden, die
+    # match_betreuer() nicht (mehr) auflösen konnte - meist durch Extraktions-
+    # Artefakte (abgeschnittene Namen wg. Spaltenbreite, oder bei Concordia
+    # ein an den abgeschnittenen Namen gehaengtes Datum, siehe
+    # extract_generic_table()/VHV_NAME_COLUMN_X0_MIN). Die Concordia-Zeilen
+    # mit angehaengtem "01.08.26" werden sich in kuenftigen Monaten mit
+    # anderem Datum wiederholen und brauchen dann jeweils einen neuen
+    # Override-Eintrag, bis die Extraktion selbst repariert ist.
+    "Golfplatz Heddesheim, Gut Neuz": "Andreas Selle",  # Mannheimer
+    "Golfplatz Kurpfalz, GmbH & Co.": "Andreas Selle",  # Mannheimer
+    "Rainer Marzenell & Botho Finck": "Robin Heckmann",  # Mannheimer
+    "Petri + Söhne GmbH": "Robin Heckmann",  # Mannheimer
+    "M.S. Car Logistic UG": "Robin Heckmann",  # Mannheimer + VHV, dasselbe Unternehmen
+    "NETLINE Gesellschaft für": "Tim Selle",  # Hiscox, abgeschnitten
+    "Schäfer, Brigi 01.08.26": "Robin Heckmann",  # Concordia
+    "Gumbel, Patric 01.08.26": "Tim Selle",  # Concordia
+    "Katzir- Shimon 01.08.26": "Robin Heckmann",  # Concordia, derselbe Kunde wie "Katzir-Shimo"
+    "7 Aygan T&O Gm 01.08.26": "Robin Heckmann",  # Concordia
+    "Take Time Bist 01.08.26": "Robin Heckmann",  # Concordia
+    "Mercante, Ales 01.08.26": "Tim Selle",  # Concordia
+    "Mohedien, Jiea 01.08.26": "Robin Heckmann",  # Concordia
+    "Oppermann, Thi 01.08.26": "Robin Heckmann",  # Concordia
+    "Kircher, Gisel 01.08.26": "Robin Heckmann",  # Concordia
+    "Becker, Marina 01.08.26": "Robin Heckmann",  # Concordia
+    "Bonvissuto, Do 01.08.26": "Robin Heckmann",  # Concordia
+    "Garcia, Oscar 01.08.26": "Robin Heckmann",  # Concordia
+    "Heckmann, Devo 01.08.26": "Robin Heckmann",  # Concordia
+    "Pavelic, Phili 01.08.26": "Robin Heckmann",  # Concordia
+    "Domingos, Yona 01.08.26": "Robin Heckmann",  # Concordia
+    "Krasniqi, Just 01.08.26": "Robin Heckmann",  # Concordia
+    "Motejat, Vanes 01.08.26": "Tim Selle",  # Concordia
+    "Hustiuc, Mihai 01.08.26": "Tim Selle",  # Concordia
+    "Badescu, Vili- 01.08.26": "Tim Selle",  # Concordia
+    "Marin, Constan 01.08.26": "Tim Selle",  # Concordia
+    "Da Costa, Dani 01.08.26": "Robin Heckmann",  # Concordia
+    "Martirosjan, D 01.08.26": "Tim Selle",  # Concordia
+    "Burke, Katarin 01.08.26": "Robin Heckmann",  # Concordia
+    "Beeken, Martin 01.08.26": "Robin Heckmann",  # Concordia
+    "Holzapfel": "Robin Heckmann",  # Alte-Leipziger, nur Nachname
+    "Dipl.-Ing. Jürgen Daske Daske Architekten+Ingenieure": "Robin Heckmann",  # VHV
+    "TAIN-KIM-HENG IMPORT-EXPORT": "Robin Heckmann",  # VHV
+    "GmbH RET Automotive und Logistik": "Tim Selle",  # VHV
+    "Benjamin Sebastian Brendle": "Tim Selle",  # VHV
+    "Motor Hub Global GmbH": "Robin Heckmann",  # VHV
+    "Sabrina Dana Hofstätter": "Tim Selle",  # VHV
+    "Enrico Marco Pennino": "Tim Selle",  # VHV
+    "Kiet Nho Tieu": "Robin Heckmann",  # VHV
+    "Angela Ignazia Costa": "Tim Selle",  # VHV
+    "GmbH INTE Informationstechnologie": "Robin Heckmann",  # VHV, "RH " abgeschnitten
+    "Leticia Natascha Viviani": "Robin Heckmann",  # VHV
+    "Aaliyah Angelina Viviani": "Robin Heckmann",  # VHV
+    "Heizung Sanitär Klimatechnik Nico Geschwill Meisterbetrieb": "Robin Heckmann",  # VHV
+    "Slike Brecht": "Robin Heckmann",  # VHV
+    "Said Omar Saidi": "Tim Selle",  # VHV
+    "Patrizia Göhlich": "Robin Heckmann",  # VHV
+    "Vanessa Patrizia Di Stefano": "Tim Selle",  # VHV
+    "PFANDLEIHHAUS G": "Tim Selle",  # Württembergische, abgeschnitten
+    "VENDING GBR CMB": "Tim Selle",  # Württembergische, abgeschnitten
+    "Heckmann": "Robin Heckmann",  # Auxilia, nur Nachname - Vorsicht bei Kollision mit anderen "Heckmann"-Kunden
+    "Marcello": "Robin Heckmann",  # Auxilia, nur Nachname
+    "Naser": "Robin Heckmann",  # Auxilia, nur Nachname
+    "Baziari": "Robin Heckmann",  # Auxilia, nur Nachname
+    "Seyhan*Bekyigat": "Tim Selle",  # Deurag
+    "Mohammad*Mohammad": "Tim Selle",  # Deurag
+    "Hertel*Daniela": "Robin Heckmann",  # Deurag
+    "AHNOGLZEALPOFEL, PATRIK": "Robin Heckmann",  # Haftpflichtkasse, OCR-verzerrt
+    "BONVISSUTO": "Robin Heckmann",  # Haftpflichtkasse
+    "WEG Behrensstr. 20 v.d.": "Robin Heckmann",  # Haftpflichtkasse
+    "WEG Industriestr. 24, v.D.": "Robin Heckmann",  # Haftpflichtkasse
+    "WEG Zimmermann/ Sattler": "Robin Heckmann",  # Domcura (WEG Zimmermann/Sattler)
+    "Duong": "Robin Heckmann",  # Domcura - passt zu Nutzer-Zielwert (Domcura komplett RH)
+    # Dialog, August-2026: extract_dialog() liest die 4 Kundennamen wegen
+    # des Wasserzeichen-Punktrasters nur verlesen (siehe extract_dialog()) -
+    # per Betrag eindeutig zugeordnet: 148,81+73,09+23,28=245,18 EUR passt
+    # exakt zum Nutzer-Zielwert TS, 82,89 EUR exakt zum Nutzer-Zielwert RH.
+    "JAngolo Gatto Ro": "Tim Selle",  # eigentlich Angelo Gatto Rotondo
+    "Popodopoulom F": "Tim Selle",  # eigentlich Papadopoulou, Maria
+    "S Innereausb": "Tim Selle",  # eigentlich G & S Innenausbau GmbH
+    "MNEG Prinzregent": "Robin Heckmann",  # eigentlich WEG Prinzregentenstr. 18
+    "Duc": "Robin Heckmann",  # Domcura, nur Vor-/Nachname - Kollisionsrisiko
+    "MERLING ANNEMAR": "Robin Heckmann",  # Württembergische, abgeschnitten
+    "040.054.0460573.0 | Simon,Maxime": "Robin Heckmann",  # Helvetia
+    "Krawczyk, Philipp": "Tim Selle",  # Fondsfinanz
+    "Sauer-Segmann, Allianz": "Robin Heckmann",  # Fondsfinanz
+    "Born": "Tim Selle",  # Fondsfinanz, nur Nachname - Kollisionsrisiko
+    "Oscar Andres Garcia 01.08.2026": "Robin Heckmann",  # Württembergische-Adam-Riese
+    "Heckmann*Willi": "Robin Heckmann",  # Signal-Iduna
+    "Heinze*Simon": "Tim Selle",  # Signal-Iduna
+    "Vohrmann Claus Benedikt": "Robin Heckmann",  # Allianz
+    "Leitner,Dr. Hans": "Tim Selle",  # BSG - Hans Leitner
+    "Wilhelm": "Tim Selle",  # Auxilia - Vorname-Fragment von Gerhard Wilhelm Martyniak
+    "Martyniak": "Tim Selle",  # Auxilia - Nachname-Fragment von Gerhard Wilhelm Martyniak
+    # Betreuer.xlsx ist fuer Mandy Bechtel veraltet (Privatkunden-Blatt sagt
+    # "Robin Heckmann", Firmenkunden-GbR-Zeile "Tim Selle") - laut Nutzer
+    # (2026-09-14) ist sie tatsaechlich Andreas Selles Kundin, ebenso die GbR
+    # "Rene Gutperle/Thomas Czech/Angela Czech/Mandy Bechtel ... GbR" (passt
+    # zum bereits bestehenden "Gutperle & Czech"-Override oben). Betreuer.xlsx
+    # sollte an der Quelle korrigiert werden, dieser Override greift bis
+    # dahin.
+    "Bechtel, Mandy": "Andreas Selle",
+    "Bechtel": "Andreas Selle",
+    # Mannheimer: laesst sich exakt (154,39 EUR) auf die RH->AS-Differenz in
+    # dieser Abrechnung zurueckfuehren, passt zum Gutperle/Czech-Cluster
+    # (siehe "Gutperle & Czech" oben) - bestaetigt durch exakten AS-Treffer
+    # (1.060,57 EUR) in der August-2026-Abstimmung.
+    "Werner Gutperle GmbH & Co.KG": "Andreas Selle",
+    # Wuerttembergische (VM 0821-2534-5-01), August-2026: vom Nutzer
+    # bestaetigt (2026-09-14). Kovacic Edita bleibt laut Nutzer TS (NICHT
+    # RH, wie zunaechst - falsch - aus der 4,31-EUR-Restdifferenz vermutet) -
+    # die Ursache dieser Restdifferenz ist noch ungeklaert.
+    "Czech Thomas": "Tim Selle",
 }
 
 # Kennzeichen fuer nicht-kundenspezifische Sammelabzuege innerhalb einer
@@ -1451,6 +1945,21 @@ MANUAL_BETREUER_OVERRIDES_RAW = {
 # behandelt (Zuordnung zur groessten Kundenposition derselben Datei), nicht
 # ueber die normale Namenszuordnung.
 COLLECTIVE_DEDUCTION_MARKER = "nicht kundenspezifisch"
+
+# Kennzeichen fuer Betraege, die AUCH NICHT ueber COLLECTIVE_DEDUCTION_MARKER
+# (Zuordnung zur groessten Kundenposition derselben Datei) behandelt werden
+# sollen, weil sie sich ueberhaupt keinem einzelnen Kunden/Partner zuordnen
+# lassen - z.B. die Auszahlung einer freien Stornoreserve bei Amex-Pool
+# (siehe extract_amex_stornoreserve_auszahlung()): Lebensversicherungs-
+# Provisionen werden bei SSH vollstaendig verbucht, obwohl ein Teil davon
+# zunaechst als Stornoreserve einbehalten wird - die Betreuer-Zuordnung
+# erfolgt also schon beim urspruenglichen Buchungsdatum. Wird die Reserve
+# spaeter (manuell angestossen) ausgezahlt, betrifft das rueckwirkend viele
+# verschiedene, nicht mehr einzeln nachvollziehbare Kunden/Partner (Nutzer-
+# Bestaetigung) - die Zeile bleibt daher bewusst ohne Betreuer UND wird aus
+# dem "Kunde_ohne_Betreuer"-Blatt ausgeblendet (siehe write_excel()/app.py),
+# damit sie dort nicht faelschlich als offener Pruef-Fall auftaucht.
+NICHT_ZUORDENBAR_MARKER = "nicht zuordenbar"
 
 GEB_RE = re.compile(r"\(geb\.?[^)]*\)|\bgeb\.?:?\s.*$", re.IGNORECASE)
 LEGAL_FORM_SUFFIXES = ["gmbhcokg", "gmbh", "cokg", "ug", "ev", "ag", "se", "kg", "ohg", "gbr"]
@@ -1717,45 +2226,35 @@ DIALOG_AMOUNT_RE = re.compile(r"-?\d{1,3}(?:\.\d{3})*,\d{2}")
 
 
 def find_dialog_total_hint(pdf):
-    """Dialog: die Kundenpositionen-Tabelle selbst ist zu dicht/klein
-    gedruckt (teils zusaetzlich durch Textmarker-Anmerkungen ueberdeckt) fuer
-    zuverlaessige OCR - siehe OCR_UNRELIABLE_INSURERS. Die 'PG-Uebersicht'-
-    Seite (aggregierte Summe je Produktgruppe, kein Kundenbezug) ist aber
-    grossformatig genug, dass zumindest der Kontrollbetrag ("Summe gesamt")
-    per OCR mit Schwellwert-Vorverarbeitung + Sparse-Text-Modus (--psm 11)
-    einigermassen zuverlaessig lesbar ist - wird nur als Kontroll-Hinweis
-    verwendet (Blatt "Manuelle_Pruefung"), nicht als belastbarer Wert."""
+    """Dialog: die eigentliche Kundenpositionen-Tabelle wird ueber
+    extract_dialog() gelesen (zeilenweiser Zuschnitt + Median-Filter gegen
+    das Wasserzeichen-Punktraster). Diese Funktion liest stattdessen die
+    hochkant-Seiten (Deckblatt, Abrechnungsuebersicht, 'PG-Uebersicht') -
+    der Gesamtbetrag ("Summe gesamt") steht dort mehrfach (Uebersichts-
+    UND Deckblatt-Seite), oft zusammen mit viel Bildrauschen durch dasselbe
+    Wasserzeichen-Punktraster wie auf der Detailseite. Verlaesslicher
+    Text-Anker wie "Summe" ueberlebt die OCR dabei nicht immer (selbst mit
+    Schwellwert-Vorverarbeitung + Sparse-Text-Modus --psm 11) - stattdessen
+    werden alle erkannten Dezimalbetraege ueber saemtliche hochkant-Seiten
+    gesammelt und der insgesamt haeufigste zurueckgegeben (der echte
+    Gesamtbetrag taucht erfahrungsgemaess auf mehreren Seiten auf, zufaellige
+    OCR-Fehlwerte dagegen nicht). Dient als Pflicht-Gegenprobe fuer
+    extract_dialog()'s Ergebnis (siehe process_file())."""
     if not OCR_AVAILABLE:
         return None
+    all_amounts = []
     for page in pdf.pages:
-        if len(page.chars) > 0:
-            continue  # keine gescannte Seite
+        if len(page.chars) > 0 or page.width > page.height:
+            continue  # keine gescannte Seite bzw. die quer liegende Detailseite
         im = page.to_image(resolution=400).original.convert("L")
         im = ImageOps.autocontrast(im, cutoff=1)
         im = im.point(lambda p: 255 if p > 150 else 0)
         ocr_text = pytesseract.image_to_string(im, lang="deu", config="--psm 11")
-        if "summe" not in ocr_text.lower():
-            continue
-        amounts = [parse_amount(a) for a in DIALOG_AMOUNT_RE.findall(ocr_text)]
-        amounts = [a for a in amounts if a is not None]
-        if amounts:
-            return Counter(amounts).most_common(1)[0][0]
-    return None
+        all_amounts.extend(a for a in (parse_amount(m) for m in DIALOG_AMOUNT_RE.findall(ocr_text)) if a)
+    if not all_amounts:
+        return None
+    return Counter(all_amounts).most_common(1)[0][0]
 
-
-# Gescannte PDFs mit mehrspaltigem Karten-Layout: die OCR liest zwar Woerter,
-# aber Namens- und Betragsspalten laufen dabei durcheinander (Brief-Kopfzeilen
-# und Firmierungs-Zusaetze werden faelschlich als "Kunde" erkannt). Lieber
-# ehrlich zur manuellen Pruefung markieren als falsche Zuordnungen liefern.
-# Alte Leipziger ist NICHT mehr hier: die Scans sind sauber, siehe
-# extract_alte_leipziger(). Barmenia ebenfalls nicht mehr: die Detailseiten
-# lesen sich bei 400dpi/psm6 zuverlaessig, siehe extract_barmenia().
-# Continentale ebenfalls nicht mehr: eigener Multi-Aufloesungs-Pfad mit
-# Pflicht-Abgleich gegen den aufgedruckten "Neuer Saldo", siehe
-# extract_continentale() - faellt bei Abweichung selbst automatisch auf
-# manuelle Pruefung zurueck, muss deshalb nicht mehr hier pauschal
-# ausgeschlossen werden.
-OCR_UNRELIABLE_INSURERS = ["dialog"]
 
 # Versicherer, die ihre Betragsspalte aus ihrer eigenen Soll/Haben-Sicht
 # drucken statt aus Maklersicht - ein bei ihnen negativer Betrag ist fuer
@@ -1846,20 +2345,33 @@ def process_file(filepath, month_folder):
                 "rows": [], "total_hint": total_hint,
             }
 
-        if any(k in insurer.lower() for k in OCR_UNRELIABLE_INSURERS):
-            total_hint = find_total_in_text(full_text)
-            if "dialog" in insurer.lower():
-                total_hint = find_dialog_total_hint(pdf) or total_hint
+        if insurer_lower == "dialog" and OCR_AVAILABLE:
+            # Dialog 'Provisionseinzelnachweis': dichte Tabelle mit
+            # gepunktetem Wasserzeichen-Hintergrund, der normale OCR fast
+            # vollstaendig verwirrt - eigener zeilenweiser Zuschnitt-Pfad
+            # mit Median-Filter, siehe extract_dialog(). Ergebnis wird
+            # zwingend gegen die "Summe gesamt" von der PG-Uebersichtsseite
+            # geprueft (find_dialog_total_hint) - bei Abweichung faellt die
+            # Datei automatisch auf manuelle Pruefung zurueck statt falsche
+            # Zahlen zu liefern (gleiches Muster wie extract_continentale()).
+            rows = extract_dialog(pdf.pages)
+            target_total = find_dialog_total_hint(pdf)
+            extracted_sum = round(sum(r[2] for r in rows), 2)
+            if not rows or target_total is None or abs(extracted_sum - target_total) > 0.01:
+                return {
+                    "insurer": insurer, "file": filename, "status": "sonderformat",
+                    "reason": "OCR-Ergebnis der Kundenpositionen stimmt nicht "
+                              "(oder konnte nicht geprueft werden) mit der im "
+                              "PDF aufgedruckten 'Summe gesamt' ueberein "
+                              f"(extrahiert: {extracted_sum}, Soll: {target_total}) "
+                              "- bitte manuell pruefen, um keine falschen "
+                              "Kundenzuordnungen zu riskieren.",
+                    "rows": [], "total_hint": target_total,
+                }
             return {
-                "insurer": insurer, "file": filename, "status": "sonderformat",
-                "reason": "Gescanntes PDF - enthaelt echte Kundenpositionen, "
-                          "aber die Texterkennung (OCR) ist zu unzuverlaessig "
-                          "(vertauscht Namen/Betraege bzw. liefert zu viel "
-                          "Bildrauschen). Automatische Kundenzuordnung in "
-                          "dieser Version nicht moeglich - bitte manuell "
-                          "pruefen, NICHT als Sammelbeleg ohne Details "
-                          "missverstehen.",
-                "rows": [], "total_hint": total_hint,
+                "insurer": insurer, "file": filename, "status": "ok",
+                "reason": "OCR verwendet, gegen 'Summe gesamt' verifiziert",
+                "rows": rows, "total_hint": target_total,
             }
 
         if insurer_lower == "continentale" and OCR_AVAILABLE:
@@ -1891,8 +2403,11 @@ def process_file(filepath, month_folder):
             # Barmenia/Gothaer 'Vergluetungsnachweis': gescanntes PDF, dessen
             # Detailtabelle mit dem Standard-OCR-Pfad (300dpi, wortpositions-
             # basiert) die Betragsspalten verliert - eigener Pfad mit
-            # hoeherer Aufloesung, siehe extract_barmenia().
-            rows = extract_barmenia(pdf)
+            # hoeherer Aufloesung, siehe extract_barmenia(). Die "Laufende &
+            # Folgeprovisionen"-Seiten haben eine ANDERE, noch dichtere
+            # Tabellenvorlage und brauchen eine eigene zeilenweise Zuschnitt-
+            # Extraktion, siehe extract_barmenia_laufende().
+            rows = extract_barmenia(pdf) + extract_barmenia_laufende(pdf)
             total_hint = find_total_in_text(full_text)
             if not rows:
                 return {
@@ -2007,8 +2522,23 @@ def process_file(filepath, month_folder):
                     "Vertrauensschadenversicherung-Beitrag (nicht kundenspezifisch, siehe Abrechnungsuebersicht)",
                     round(vsv_amount, 2), vsv_line, "text",
                 ))
+        elif "amex" in insurer_lower:
+            rows = extract_generic_table(pages_words)
+            auszahlung = extract_amex_stornoreserve_auszahlung(list(enumerate(full_text_parts)))
+            if auszahlung:
+                a_page, a_amount, a_line = auszahlung
+                rows.append((
+                    a_page,
+                    f"Auszahlung freie Stornoreserve ({NICHT_ZUORDENBAR_MARKER}, "
+                    "siehe Sonstige Positionen)",
+                    round(a_amount, 2), a_line, "text",
+                ))
         elif "sparkassenversicherung" in insurer_lower:
             rows = extract_sv_sparkasse(pages_words)
+        elif "domcura" in insurer_lower:
+            rows = extract_domcura(pages_words)
+        elif "ergo" in insurer_lower:
+            rows = extract_ergo(pages_words)
         else:
             rows = extract_generic_table(pages_words)
 
@@ -2216,7 +2746,10 @@ def write_excel(df_rows, df_control, df_agg, df_problem, out_target, df_bank_unm
             {"betrag"},
         ))
     if has_betreuer:
-        df_unmatched = df_rows[df_rows["Betreuer"].isna()][
+        unmatched_mask = df_rows["Betreuer"].isna() & ~df_rows["Kunde"].str.contains(
+            NICHT_ZUORDENBAR_MARKER, na=False
+        )
+        df_unmatched = df_rows[unmatched_mask][
             ["Versicherer", "Kunde", "Provision", "Datei"]
         ].drop_duplicates()
         sheets.append((
@@ -2246,22 +2779,32 @@ def write_excel(df_rows, df_control, df_agg, df_problem, out_target, df_bank_unm
 def _build_summary_frames(df_rows):
     """Baut die beiden Tabellen fuer das Blatt 'Zusammenfassung': Summe je
     Versicherer (immer) sowie Summe je Partner inkl. 'Nicht zugeordnet'
-    (nur wenn eine Betreuer-Zuordnung vorliegt, sonst None)."""
+    (nur wenn eine Betreuer-Zuordnung vorliegt, sonst None).
+
+    NICHT_ZUORDENBAR_MARKER-Zeilen (z.B. Amex-Pool-Stornoreserve-Auszahlung)
+    fliessen NICHT in diese Summen ein - sie wurden beim urspruenglichen
+    Buchungsdatum bereits voll verbucht/einem Partner zugerechnet (siehe
+    NICHT_ZUORDENBAR_MARKER-Definition), die spaetere Auszahlung darf den
+    Monatsumsatz daher nicht ein zweites Mal erhoehen (Nutzer-Bestaetigung:
+    die eigene Monatsuebersicht fuehrt diese Auszahlung gar nicht erst als
+    Position)."""
     if df_rows is None or df_rows.empty:
         return pd.DataFrame(columns=["Versicherer", "Summe"]), None
 
+    df_summary_rows = df_rows[~df_rows["Kunde"].str.contains(NICHT_ZUORDENBAR_MARKER, na=False)]
+
     df_insurer_sum = (
-        df_rows.groupby("Versicherer", as_index=False)["Provision"].sum()
+        df_summary_rows.groupby("Versicherer", as_index=False)["Provision"].sum()
         .rename(columns={"Provision": "Summe"})
         .sort_values("Summe", ascending=False)
     )
 
     df_partner_sum = None
     if "Betreuer" in df_rows.columns:
-        rows = [{"Partner": p, "Summe": df_rows.loc[df_rows["Betreuer"] == p, "Provision"].sum()}
+        rows = [{"Partner": p, "Summe": df_summary_rows.loc[df_summary_rows["Betreuer"] == p, "Provision"].sum()}
                 for p in PARTNER_NAMES]
         rows.append({"Partner": "Nicht zugeordnet",
-                      "Summe": df_rows.loc[df_rows["Betreuer"].isna(), "Provision"].sum()})
+                      "Summe": df_summary_rows.loc[df_summary_rows["Betreuer"].isna(), "Provision"].sum()})
         df_partner_sum = pd.DataFrame(rows)
 
     return df_insurer_sum, df_partner_sum
@@ -2278,7 +2821,7 @@ def _write_partner_summary(ws, df_insurer_sum, df_partner_sum):
     ws.cell(row=start_row, column=1, value="Partner")
     ws.cell(row=start_row, column=2, value="Summe")
 
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_fill = PatternFill(start_color="FF1F4E78", end_color="FF1F4E78", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     for col_idx in (1, 2):
         cell = ws.cell(row=start_row, column=col_idx)
@@ -2337,7 +2880,7 @@ def _style_worksheet(ws, df, columns, currency_cols):
     if n_cols == 0:
         return
 
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_fill = PatternFill(start_color="FF1F4E78", end_color="FF1F4E78", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     for col_idx in range(1, n_cols + 1):
         cell = ws.cell(row=1, column=col_idx)
@@ -2365,7 +2908,7 @@ def _style_worksheet(ws, df, columns, currency_cols):
     if n_rows > 0 and "Differenz" in columns:
         diff_letter = get_column_letter(columns.index("Differenz") + 1)
         rng = f"{diff_letter}2:{diff_letter}{n_rows + 1}"
-        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        red_fill = PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid")
         ws.conditional_formatting.add(
             rng,
             CellIsRule(operator="notEqual", formula=["0"], fill=red_fill),
@@ -2535,7 +3078,13 @@ def main():
         sys.exit(1)
 
     pdf_files = sorted(glob.glob(os.path.join(input_dir, "Abrechnung-*.pdf")))
-    csv_files = sorted(glob.glob(os.path.join(input_dir, "VEMA-Poolabrechnung-*.csv")))
+    # Nicht nur "VEMA-Poolabrechnung-N.csv" (urspruenglicher Dateiname beim
+    # Download) - der Nutzer benennt die Datei manchmal wie die PDFs um
+    # (z.B. "Abrechnung-1-VEMA-Pool-August-2026.csv", siehe August-2026).
+    # extract_vema_csv() prueft ohnehin selbst anhand der Spalten (Betrag-
+    # Spalte vorhanden?), ob es sich um eine echte VEMA-Pool-CSV handelt -
+    # jede .csv im Ordner ist daher ein sicherer Kandidat.
+    csv_files = sorted(glob.glob(os.path.join(input_dir, "*.csv")))
     files = pdf_files + csv_files
     print(f"Gefunden: {len(pdf_files)} Abrechnungs-PDFs und {len(csv_files)} "
           f"VEMA-Pool-CSV(s) in {month_folder}")

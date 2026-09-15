@@ -26,6 +26,22 @@ ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 LOGO_PATH = os.path.join(ASSETS_DIR, "ssh_logo.png")
 FAVICON_PATH = os.path.join(ASSETS_DIR, "favicon.png")
 
+# Zentral hinterlegte Betreuer.xlsx (z.B. ein fuer alle Mitarbeiter
+# erreichbarer Netzlaufwerk-/WTS-Pfad) - wird automatisch verwendet, wenn
+# vorhanden, damit nicht jeder Mitarbeiter die Datei manuell suchen und bei
+# jeder Nutzung erneut hochladen muss. Pfad wird per Umgebungsvariable
+# gesetzt (in .streamlit/secrets.toml als [general] BETREUER_XLSX_PATH="..."
+# oder als System-Umgebungsvariable auf dem Server, der die App hostet) -
+# kein Pfad im Code, da der je nach Rechner/Deployment unterschiedlich ist.
+# Der manuelle Upload weiter unten bleibt zusaetzlich moeglich und hat
+# Vorrang, falls jemand eine andere/aktuellere Datei verwenden will.
+try:
+    DEFAULT_BETREUER_PATH = st.secrets.get("BETREUER_XLSX_PATH", "")
+except Exception:
+    DEFAULT_BETREUER_PATH = ""
+DEFAULT_BETREUER_PATH = DEFAULT_BETREUER_PATH or os.environ.get("BETREUER_XLSX_PATH", "")
+DEFAULT_BETREUER_AVAILABLE = bool(DEFAULT_BETREUER_PATH) and os.path.isfile(DEFAULT_BETREUER_PATH)
+
 st.set_page_config(
     page_title="Courtage-Extraktor",
     page_icon=FAVICON_PATH if os.path.exists(FAVICON_PATH) else "📄",
@@ -136,12 +152,23 @@ uploaded_bank_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-uploaded_betreuer_file = st.file_uploader(
-    "Betreuer.xlsx (optional) - ordnet jeden Umsatz Robin Heckmann/Tim Selle/Andreas Selle "
-    "zu und markiert die Kundenzeilen farbig (Rot/Gelb/Blau)",
-    type=["xlsx"],
+betreuer_uploader_label = (
+    "Betreuer.xlsx"
+    + (" (optional - abweichende/aktuellere Datei statt der hinterlegten)"
+       if DEFAULT_BETREUER_AVAILABLE else " (optional)")
+    + " - ordnet jeden Umsatz Robin Heckmann/Tim Selle/Andreas Selle "
+      "zu und markiert die Kundenzeilen farbig (Rot/Gelb/Blau)"
 )
-if uploaded_betreuer_file is None:
+uploaded_betreuer_file = st.file_uploader(betreuer_uploader_label, type=["xlsx"])
+if uploaded_betreuer_file is not None:
+    pass  # manuell hochgeladene Datei hat Vorrang, siehe Verarbeitungsblock unten
+elif DEFAULT_BETREUER_AVAILABLE:
+    st.caption(
+        "ℹ️ Es wird die zentral hinterlegte Betreuer.xlsx verwendet "
+        f"({DEFAULT_BETREUER_PATH}). Lade oben eine Datei hoch, um stattdessen "
+        "eine andere/aktuellere Version fuer diesen Lauf zu verwenden."
+    )
+else:
     st.caption(
         "⚠️ Ohne Betreuer.xlsx bleiben Excel und PDF-Uebersicht **ohne** "
         "Betreuer-Zuordnung/Farbmarkierung - die Datei muss bei jeder "
@@ -182,11 +209,16 @@ if process_clicked and uploaded_files:
         progress_bar.empty()
         status_text.empty()
 
+        betreuer_path = None
         if uploaded_betreuer_file is not None:
-            betreuer_dest = os.path.join(tmp_dir, re.sub(r"[\\/]", "_", uploaded_betreuer_file.name))
-            with open(betreuer_dest, "wb") as fh:
+            betreuer_path = os.path.join(tmp_dir, re.sub(r"[\\/]", "_", uploaded_betreuer_file.name))
+            with open(betreuer_path, "wb") as fh:
                 fh.write(uploaded_betreuer_file.getbuffer())
-            betreuer_lookup = ce.load_betreuer_lookup(betreuer_dest)
+        elif DEFAULT_BETREUER_AVAILABLE:
+            betreuer_path = DEFAULT_BETREUER_PATH
+
+        if betreuer_path:
+            betreuer_lookup = ce.load_betreuer_lookup(betreuer_path)
             df_rows = ce.apply_betreuer(df_rows, betreuer_lookup)
 
         df_bank_unmatched = None
@@ -248,7 +280,10 @@ if process_clicked and uploaded_files:
             st.dataframe(df_problem, use_container_width=True)
 
         if "Betreuer" in df_rows.columns:
-            df_unmatched_betreuer = df_rows[df_rows["Betreuer"].isna()][
+            unmatched_mask = df_rows["Betreuer"].isna() & ~df_rows["Kunde"].str.contains(
+                ce.NICHT_ZUORDENBAR_MARKER, na=False
+            )
+            df_unmatched_betreuer = df_rows[unmatched_mask][
                 ["Versicherer", "Kunde", "Provision", "Datei"]
             ].drop_duplicates()
             if not df_unmatched_betreuer.empty:
