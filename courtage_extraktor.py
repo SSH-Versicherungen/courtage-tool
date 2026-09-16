@@ -42,6 +42,7 @@ import glob
 import os
 import re
 import sys
+import unicodedata
 from collections import Counter
 
 import pdfplumber
@@ -2266,7 +2267,16 @@ SIGN_INVERTED_INSURERS = {"aig", "hiscox", "mannheimer"}
 
 
 def insurer_name_from_filename(filename, month_folder):
-    base = os.path.splitext(os.path.basename(filename))[0]
+    # NFC-Normalisierung: macOS zerlegt Umlaute in Dateinamen standardmaessig
+    # in NFD (z.B. "u" + combining diaeresis statt des einzelnen Zeichens
+    # "ü") - visuell identisch, aber ein anderer Byte-/Codepoint-Verlauf.
+    # fpdf's Kernschriftart (Latin-1-basiert) kennt das freistehende
+    # Kombinationszeichen nicht und wirft FPDFUnicodeEncodingException,
+    # sobald der so abgeleitete Versicherer-Name in der PDF-Uebersicht
+    # ausgegeben wird (beobachtet: Kollege laedt Dateien von einem Mac
+    # hoch). NFC vereinheitlicht auf die zusammengesetzte Form, die sowohl
+    # fpdf als auch Excel/Betreuer.xlsx-Abgleich zuverlaessig verarbeiten.
+    base = unicodedata.normalize("NFC", os.path.splitext(os.path.basename(filename))[0])
     base = re.sub(r"^Abrechnung-\d+-", "", base)
     for m in MONTHS_DE:
         base = re.sub(rf"-{m}-\d{{4}}$", "", base)
@@ -2923,6 +2933,28 @@ def _fmt_eur(x):
     return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + " EUR"
 
 
+def _pdf_safe_text(s):
+    """Macht einen String sicher fuer die fpdf-Kernschriftart 'helvetica'
+    (nur Latin-1/WinAnsi). Zwei Faelle:
+    1. NFC-Normalisierung: macOS liefert Umlaute in Datei-/manchmal auch
+       Formularnamen standardmaessig in NFD (z.B. 'u' + freistehendes
+       Kombinations-Trema statt des einzelnen Zeichens 'ü') - visuell
+       identisch, aber Latin-1 kennt das freistehende Kombinationszeichen
+       nicht. NFC setzt das wieder zum einzelnen Zeichen zusammen, das
+       Latin-1 abdeckt (beobachtet: FPDFUnicodeEncodingException beim
+       Hochladen von einem Mac).
+    2. Fallback fuer alles, was auch nach NFC nicht in Latin-1 passt (z.B.
+       Emoji oder sonstiger OCR-Ausschuss in Kundennamen) - wird durch '?'
+       ersetzt, statt die komplette (rein informative) PDF-Uebersicht
+       abstuerzen zu lassen; das Excel-Ergebnis ist davon nie betroffen."""
+    s = unicodedata.normalize("NFC", str(s))
+    try:
+        s.encode("latin-1")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def build_summary_pdf(df_rows, out_target, month_label):
     """Erstellt eine einseitige (bzw. mehrseitige) PDF-Uebersicht: je
     Versicherer absteigend nach Gesamtumsatz sortiert, mit der jeweiligen
@@ -2938,7 +2970,7 @@ def build_summary_pdf(df_rows, out_target, month_label):
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     pdf.set_font("helvetica", "B", 16)
-    pdf.cell(0, 10, f"Courtage-Uebersicht {month_label}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, f"Courtage-Uebersicht {_pdf_safe_text(month_label)}", new_x="LMARGIN", new_y="NEXT")
 
     if df_rows is None or df_rows.empty:
         pdf.set_font("helvetica", "", 11)
@@ -2978,7 +3010,7 @@ def build_summary_pdf(df_rows, out_target, month_label):
     pdf.cell(0, 7, "Summe je Versicherer", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("helvetica", "", 9)
     for versicherer, total in insurer_totals.items():
-        pdf.cell(100, 5, versicherer)
+        pdf.cell(100, 5, _pdf_safe_text(versicherer))
         pdf.cell(0, 5, _fmt_eur(total), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
@@ -3022,7 +3054,7 @@ def build_summary_pdf(df_rows, out_target, month_label):
 
         pdf.set_xy(x_left, y_start)
         pdf.set_font("helvetica", "B", 11)
-        pdf.multi_cell(left_w, 6, versicherer)
+        pdf.multi_cell(left_w, 6, _pdf_safe_text(versicherer))
         pdf.set_x(x_left)
         pdf.set_font("helvetica", "", 9)
         pdf.multi_cell(left_w, 5, f"Gesamt:\n{_fmt_eur(total)}")
@@ -3042,7 +3074,7 @@ def build_summary_pdf(df_rows, out_target, month_label):
                 y = pdf.t_margin
             pdf.set_xy(x_right, y)
             pdf.set_text_color(*PARTNER_COLORS_PDF.get(row.Betreuer, (0, 0, 0)))
-            pdf.multi_cell(right_w, right_line_h, f"{row.Kunde} - {_fmt_eur(row.Provision)}")
+            pdf.multi_cell(right_w, right_line_h, f"{_pdf_safe_text(row.Kunde)} - {_fmt_eur(row.Provision)}")
             pdf.set_text_color(0, 0, 0)
             y = pdf.get_y()
         y_right_end, page_right_end = y, pdf.page_no()
