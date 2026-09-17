@@ -1583,6 +1583,9 @@ DIALOG_NAME_X = (133, 227)
 DIALOG_AMOUNT_X = (693, 774)
 DIALOG_AMT_RE = re.compile(r"-?\d{1,3}(?:\.\d{3})*,\d{2}")
 DIALOG_NAME_RE = re.compile(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.&\- ]{2,}")
+DIALOG_TYPICAL_ROW_HEIGHT = 220
+DIALOG_AMT_ATTEMPTS = ((0, 6), (5, 6), (0, 4), (5, 4), (0, 7), (10, 6))
+DIALOG_NAME_ATTEMPTS = ((0, 6), (5, 6), (0, 4), (5, 4), (0, 7), (10, 6))
 
 
 def extract_dialog(pages):
@@ -1635,27 +1638,61 @@ def extract_dialog(pages):
                 prev = r
             lines.append((start + prev) // 2)
 
+        bands = []
         for i in range(len(lines) - 1):
             top, bottom = lines[i], lines[i + 1]
-            if not (150 <= bottom - top <= 350):
+            gap = bottom - top
+            if gap < 150:
                 continue
-            amt_crop = im.crop((amt_x0, top, amt_x1, bottom)).convert("L").filter(ImageFilter.MedianFilter(7))
-            amt_text = pytesseract.image_to_string(amt_crop, lang="deu", config="--psm 6")
-            amt_matches = DIALOG_AMT_RE.findall(amt_text)
-            if not amt_matches:
-                continue
-            amt = parse_amount(amt_matches[-1])
-            if amt is None or abs(amt) > MAX_PLAUSIBLE_AMOUNT:
+            if gap <= 350:
+                bands.append((top, bottom))
+            else:
+                # Manche Scans zeichnen die Trennlinie zwischen zwei Zeilen zu
+                # schwach fuer den Schwarzpixel-Schwellwert (beobachtet: Juli-
+                # 2026, ganze Bloecke von 500-2000px blieben so unentdeckt und
+                # kosteten ~380 EUR echter Provision). Statt den Block ganz zu
+                # verwerfen, wird er anhand der typischen Zeilenhoehe der
+                # bereits sauber erkannten Zeilen in gleich grosse Teilzeilen
+                # aufgeteilt - schlaegt die OCR auf einer Teilzeile fehl,
+                # bleibt es (wie ueberall in dieser Funktion) bei fehlender
+                # statt falscher Zuordnung.
+                n = max(1, round(gap / DIALOG_TYPICAL_ROW_HEIGHT))
+                step = gap / n
+                bands.extend(
+                    (int(top + j * step), int(top + (j + 1) * step))
+                    for j in range(n)
+                )
+
+        for b_top, b_bottom in bands:
+            amt = None
+            for pad, psm in DIALOG_AMT_ATTEMPTS:
+                amt_crop = im.crop((amt_x0, max(0, b_top - pad), amt_x1, b_bottom + pad)) \
+                    .convert("L").filter(ImageFilter.MedianFilter(7))
+                amt_text = pytesseract.image_to_string(amt_crop, lang="deu", config=f"--psm {psm}")
+                amt_matches = DIALOG_AMT_RE.findall(amt_text)
+                if amt_matches:
+                    amt = parse_amount(amt_matches[-1])
+                    if amt is not None and abs(amt) <= MAX_PLAUSIBLE_AMOUNT:
+                        break
+                    amt = None
+            if amt is None:
                 continue
 
-            name_crop = im.crop((name_x0, top, name_x1, bottom)).convert("L").filter(ImageFilter.MedianFilter(7))
-            name_text = pytesseract.image_to_string(name_crop, lang="deu", config="--psm 6")
-            m = DIALOG_NAME_RE.search(name_text)
-            if not m:
+            name = None
+            raw_name_text = ""
+            for pad, psm in DIALOG_NAME_ATTEMPTS:
+                name_crop = im.crop((name_x0, max(0, b_top - pad), name_x1, b_bottom + pad)) \
+                    .convert("L").filter(ImageFilter.MedianFilter(7))
+                name_text = pytesseract.image_to_string(name_crop, lang="deu", config=f"--psm {psm}")
+                m = DIALOG_NAME_RE.search(name_text)
+                if m:
+                    name = m.group(0).strip()
+                    raw_name_text = name_text.strip()
+                    break
+            if not name:
                 continue
-            name = m.group(0).strip()
 
-            rows.append((pidx, name, amt, name_text.strip(), "ocr"))
+            rows.append((pidx, name, amt, raw_name_text, "ocr"))
     return rows
 
 
@@ -1694,6 +1731,36 @@ def extract_vema_csv(path):
                 continue
             betrag = parse_amount(betrag_s)
             if betrag is None:
+                continue
+            raw_line = ";".join(f"{k}={v}" for k, v in row.items() if v)
+            rows.append((0, name, round(betrag, 2), raw_line, "csv"))
+    return rows
+
+
+COVOMO_CSV_AMOUNT_COL = "Provision"
+
+
+def extract_covomo_csv(path):
+    """Covomo (Vergleichsplattform, hier beobachtet fuer eine Reise-
+    Krankenversicherung ueber HanseMerkur, Juli-2026): eigenes CSV-Format,
+    Semikolon-getrennt, u.a. Spalten 'Provision', 'KundenVorname',
+    'KundenNachname'. Wurde vorher stillschweigend als vermeintliche
+    VEMA-Pool-CSV mit falschem Spaltenformat verworfen (process_csv_file()
+    kannte nur extract_vema_csv), wodurch die Datei komplett unter den
+    Tisch fiel statt in 'Sammelbelege_ohne_Details' auf einen Sonderfall
+    hinzuweisen. Nur eine Zeile bisher beobachtet - Format kann sich mit
+    mehr Beispielen noch aendern."""
+    rows = []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        if COVOMO_CSV_AMOUNT_COL not in (reader.fieldnames or []):
+            return rows
+        for row in reader:
+            vorname = (row.get("KundenVorname") or "").strip()
+            nachname = (row.get("KundenNachname") or "").strip()
+            name = f"{nachname}, {vorname}" if vorname else nachname
+            betrag = parse_amount((row.get(COVOMO_CSV_AMOUNT_COL) or "").strip())
+            if betrag is None or not name:
                 continue
             raw_line = ";".join(f"{k}={v}" for k, v in row.items() if v)
             rows.append((0, name, round(betrag, 2), raw_line, "csv"))
@@ -2651,22 +2718,33 @@ def process_file(filepath, month_folder):
         pdf.close()
 
 
-def process_csv_file(filepath):
-    """Verarbeitet eine VEMA-Pool-CSV (siehe extract_vema_csv). Liefert
-    dasselbe Ergebnis-Dict-Format wie process_file(), damit process_files()
-    PDFs und CSVs einheitlich behandeln kann."""
+def process_csv_file(filepath, month_folder):
+    """Verarbeitet eine CSV-Datei. Bisher zwei bekannte Formate, beide per
+    Spaltenpruefung (nicht Dateiname) unterschieden, siehe extract_vema_csv()
+    und extract_covomo_csv(). Liefert dasselbe Ergebnis-Dict-Format wie
+    process_file(), damit process_files() PDFs und CSVs einheitlich
+    behandeln kann."""
     filename = os.path.basename(filepath)
     rows = extract_vema_csv(filepath)
-    if not rows:
+    if rows:
         return {
-            "insurer": "VEMA-Pool", "file": filename, "status": "sammelbeleg",
-            "reason": "Keine erkennbaren Buchungszeilen in der CSV-Datei "
-                      "gefunden (falsches Spaltenformat?).",
-            "rows": [], "total_hint": None,
+            "insurer": "VEMA-Pool", "file": filename, "status": "ok",
+            "reason": "", "rows": rows, "total_hint": None,
         }
+
+    rows = extract_covomo_csv(filepath)
+    if rows:
+        insurer = insurer_name_from_filename(filepath, month_folder)
+        return {
+            "insurer": insurer, "file": filename, "status": "ok",
+            "reason": "", "rows": rows, "total_hint": None,
+        }
+
     return {
-        "insurer": "VEMA-Pool", "file": filename, "status": "ok",
-        "reason": "", "rows": rows, "total_hint": None,
+        "insurer": "VEMA-Pool", "file": filename, "status": "sammelbeleg",
+        "reason": "Keine erkennbaren Buchungszeilen in der CSV-Datei "
+                  "gefunden (falsches Spaltenformat?).",
+        "rows": [], "total_hint": None,
     }
 
 
@@ -2693,7 +2771,7 @@ def process_files(files, month_label, progress_callback=None):
         if progress_callback:
             progress_callback(i, len(files), os.path.basename(f))
         if f.lower().endswith(".csv"):
-            result = process_csv_file(f)
+            result = process_csv_file(f, month_label)
         else:
             result = process_file(f, month_label)
         insurer = result["insurer"]
