@@ -979,6 +979,53 @@ def extract_arag(pdf):
     return rows
 
 
+BHV_HAUSBESITZER_ROW_RE = re.compile(
+    r"^\d{6,}\s+.+?\s(\d+[.,]\d{2})\s+(\d+[.,]\d{2})\s+(Herrn?|Frau|Firma)\s+(.+)$"
+)
+BHV_HAUSBESITZER_TOTAL_RE = re.compile(
+    r"Provisionsanspruch von insgesamt\s+([\d.,]+)\s*EUR", re.IGNORECASE
+)
+
+
+def extract_bayerische_hausbesitzer(pdf):
+    """Bayerische Hausbesitzer-Versicherung 'Provisionsabrechnung': gescanntes
+    Einzelblatt pro Vertrag mit Sparten-Unterzeilen (z.B. 'ELEMENTAR V 218.67
+    25.00 54.67', 'FEUER V ... ', ohne Namen) und einer abschliessenden
+    Gesamtzeile 'Vertragsnr Tarif Beitrag Provision Herr/Frau/Firma Name PLZ
+    Ort'. Der generische Tabellen-Parser fing vorher zusaetzlich Zahlen aus
+    dem Anschreiben ein (Agenturnummer, IBAN-Ziffern) und jede Sparten-
+    Unterzeile als eigene 'Kunden' - real ist pro Datei nur die Gesamtzeile
+    eine echte Kundenposition (beobachtet: Juli-2026, komplette Datei mit
+    298,17 EUR echtem Inhalt wurde so faelschlich zu 8.378,34 EUR aufgeblaeht).
+    Das im Anschreiben aufgedruckte 'Provisionsanspruch von insgesamt X EUR'
+    dient als Kontrollsumme; weicht die extrahierte Summe davon ab, faellt
+    die Datei auf manuelle Pruefung zurueck statt falsche Zahlen zu liefern."""
+    rows = []
+    total_hint = None
+    for page_idx, page in enumerate(pdf.pages):
+        if len(page.chars) > 0:
+            continue
+        im = page.to_image(resolution=400).original
+        text = pytesseract.image_to_string(im, lang="deu", config="--psm 6")
+
+        m_total = BHV_HAUSBESITZER_TOTAL_RE.search(text)
+        if m_total:
+            total_hint = parse_amount(m_total.group(1))
+
+        for line in text.splitlines():
+            m = BHV_HAUSBESITZER_ROW_RE.match(line.strip())
+            if not m:
+                continue
+            amt = parse_amount(m.group(2))
+            if amt is None or abs(amt) > MAX_PLAUSIBLE_AMOUNT:
+                continue
+            name = re.sub(r"\s+\d{5}\b.*$", "", m.group(4)).strip()
+            if not name:
+                continue
+            rows.append((page_idx, name, amt, line.strip(), "ocr"))
+    return rows, total_hint
+
+
 ALLIANZ_NUM_RE = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d{2}$")
 ALLIANZ_CONTRACT_RE = re.compile(r"^AS-\d+$")
 ALLIANZ_DIGITS_RE = re.compile(r"^\d+$")
@@ -2430,6 +2477,31 @@ def process_file(filepath, month_folder):
             return {
                 "insurer": insurer, "file": filename, "status": "ok",
                 "reason": "OCR verwendet", "rows": rows, "total_hint": total_hint,
+            }
+
+        if ("huasbesitzer" in insurer_lower or "hausbesitzer" in insurer_lower) and OCR_AVAILABLE:
+            # Bayerische Hausbesitzer-Versicherung: gescanntes Einzelblatt pro
+            # Vertrag, siehe extract_bayerische_hausbesitzer(). Ergebnis wird
+            # zwingend gegen den aufgedruckten "Provisionsanspruch von
+            # insgesamt" geprueft (gleiches Muster wie extract_dialog()).
+            rows, target_total = extract_bayerische_hausbesitzer(pdf)
+            extracted_sum = round(sum(r[2] for r in rows), 2)
+            if not rows or target_total is None or abs(extracted_sum - target_total) > 0.01:
+                return {
+                    "insurer": insurer, "file": filename, "status": "sonderformat",
+                    "reason": "OCR-Ergebnis der Kundenposition(en) stimmt nicht "
+                              "(oder konnte nicht geprueft werden) mit dem im "
+                              "PDF aufgedruckten 'Provisionsanspruch von "
+                              f"insgesamt' ueberein (extrahiert: {extracted_sum}, "
+                              f"Soll: {target_total}) - bitte manuell pruefen, "
+                              "um keine falschen Kundenzuordnungen zu riskieren.",
+                    "rows": [], "total_hint": target_total,
+                }
+            return {
+                "insurer": insurer, "file": filename, "status": "ok",
+                "reason": "OCR verwendet, gegen 'Provisionsanspruch von "
+                          "insgesamt' verifiziert",
+                "rows": rows, "total_hint": target_total,
             }
 
         if insurer_lower == "arag" and OCR_AVAILABLE:
