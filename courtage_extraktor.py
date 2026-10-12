@@ -1404,6 +1404,33 @@ def extract_alte_leipziger(pages_words):
                 li += 1
                 continue
 
+            # Eine neue Vertrags-/Policen-Nummer (langer Ziffernblock am
+            # Zeilenanfang) ODER ein Buchungsart-Schlagwort wie
+            # "Folgeinkasso"/"Neuinkasso"/... markiert den Beginn eines NEUEN
+            # Kundenblocks - reine Sparten-Folgezeilen DESSELBEN Kunden (z.B.
+            # mehrere Elementar-/Feuer-/Leitungswasser-Anteile unter einer
+            # Police) tragen weder die Nummer noch dieses Schlagwort erneut,
+            # sondern beginnen direkt mit dem Sparten-Namen. Die Policen-
+            # nummer allein reicht NICHT als Signal, da sie bei der
+            # Worterkennung gelegentlich ganz verloren geht, waehrend das
+            # Buchungsart-Wort selbst erhalten bleibt (beobachtet:
+            # September-2026 - bei "000031101525 Folgeinkasso Gewerbliche..."
+            # fehlte die Policennummer in der erkannten Zeile komplett, nur
+            # "Folgeinkasso ..." blieb uebrig). Ohne diese Erkennung haengt
+            # sich der Name des naechsten Kunden einfach an den vorherigen
+            # an, sobald beide Kundenbloecke vor derselben "Zwischensumme"
+            # liegen (beobachtet: "Back, Heinrich" (1 Position) gefolgt von
+            # "VIP Baudienstleistungen & Handels GmbH" (8 Sparten-
+            # Positionen) wurden faelschlich zu einem Kunden mit beiden
+            # Namen zusammengezogen UND alle 9 Betraege diesem einen
+            # kombinierten Namen zugerechnet).
+            is_new_block_head = bool(
+                re.match(r"^\d{6,}\b", line_text)
+                or re.match(r"^(Folge|Neu|Erst|Storno|Nach)inkasso\b", line_text, re.IGNORECASE)
+            )
+            if block_name_parts and is_new_block_head:
+                flush(page_idx, source)
+
             name_l, name_r = columns["name_range"]
             amt_l, amt_r = columns["amount_range"]
             name_words = [w for w in line["words"] if name_l <= w["x0"] < name_r]
@@ -2052,6 +2079,69 @@ MANUAL_BETREUER_OVERRIDES_RAW = {
     # RH, wie zunaechst - falsch - aus der 4,31-EUR-Restdifferenz vermutet) -
     # die Ursache dieser Restdifferenz ist noch ungeklaert.
     "Czech Thomas": "Tim Selle",
+
+    # September-2026: von Robin manuell hergeleitete Zuordnung. Concordia-
+    # Zeilen mit angehaengtem Buchungsdatum (z.B. "Lamitschka, Ph") werden ab
+    # jetzt ueber strip_trailing_date() in apply_betreuer() datumsunabhaengig
+    # abgeglichen - der Key hier steht daher OHNE Datum und gilt fuer alle
+    # Monate, nicht nur September.
+    "Marcel Martin Wolfgang Bajer": "Tim Selle",  # VHV
+    "Bau & Elektrotechnik GmbH Czech": "Tim Selle",  # VHV
+    "und Netzbau GmbH autmatec Leitungs-": "Robin Heckmann",  # VHV, Wortreihenfolge vertauscht - eigentlich "autmatec Leitungs- und Netzbau GmbH"
+    "Raymond Oliver Ruppert Mügge": "Tim Selle",  # VHV
+    "MSC GmbH in Gründung": "Tim Selle",  # VHV
+    "Jennifer Nkiruka Anagbogu": "Robin Heckmann",  # VHV
+    "schaft mbH FGH Zertifizierungsgesell-": "Tim Selle",  # VHV, umgebrochen/abgeschnitten - eigentlich "FGH Zertifizierungsgesellschaft mbH"
+    "Immobilien GmbH, Empire Home": "Robin Heckmann",  # HDI, Wortreihenfolge vertauscht - eigentlich "Empire Home Immobilien GmbH"
+    "D. Bellgardt & M. Sößer GbR": "Robin Heckmann",  # HDI (abgekuerzte Form; volle Form "Daniel Bellgardt und Michael Sößer GbR" matcht bereits ueber Betreuer.xlsx)
+    "7 Aygan T&Ö GmbH": "Robin Heckmann",  # HDI
+    "Restaurant Artischocke": "Robin Heckmann",  # HDI
+    "Aladinco Baudienstleistungen": "Tim Selle",  # HDI
+    "Back, Heinrich": "Robin Heckmann",
+    "VIP Baudienstleistungen & Handels GmbH": "Tim Selle",
+    "VIP Baudienstleistungen & Hand": "Tim Selle",  # dieselbe Firma, abgeschnitten (VHV)
+    "Rudolf Wiedemann Bärbel Henika": "Robin Heckmann",
+    "Jukadio Sports": "Robin Heckmann",
+    "Schadenszentrum Rhein-Neckar": "Robin Heckmann",
+    "Michelhans Isa": "Robin Heckmann",
+    "CARVISION": "Tim Selle",  # Württembergische, abgeschnitten
+
+    # Concordia, abgeschnittener Name + Buchungsdatum (siehe strip_trailing_date()
+    # oben - Key hier bewusst OHNE Datum, damit er monatsunabhaengig greift):
+    "Lamitschka, Ph": "Tim Selle",
+    "Dos Santos Car": "Robin Heckmann",  # andere Abschneidestelle als bestehendes "Dos Santos Card"
+    "Katzir-Shimoni": "Robin Heckmann",  # andere Abschneidestelle als bestehendes "Katzir-Shimo"
+    "7 Aygan T&O Gm": "Robin Heckmann",  # Concordia-Truncation derselben Firma wie "7 Aygan T&Ö GmbH" oben
+    "Take Time Bist": "Robin Heckmann",  # dieselbe Firma wie "Take Time Bistro" unten, abgeschnitten
+    "Take Time Bistro": "Robin Heckmann",
+    "Mohedien, Jiea": "Robin Heckmann",
+    "Oppermann, Thi": "Robin Heckmann",
+    "Mercante, Ales": "Tim Selle",
+    "Kircher, Gisel": "Robin Heckmann",
+    "Becker, Marina": "Robin Heckmann",
+    "Bonvissuto, Do": "Robin Heckmann",  # anderer Kunde als bestehendes "BONVISSUTO" (Haftpflichtkasse)
+    "Garcia, Oscar": "Robin Heckmann",
+    "Heckmann, Devo": "Robin Heckmann",
+    "Pavelic, Phili": "Robin Heckmann",
+    "Domingos, Yona": "Robin Heckmann",
+    "Krasniqi, Just": "Robin Heckmann",  # Fondsfinanz-Truncation von Krasniqi, Justin
+    "Badescu, Vili-": "Tim Selle",
+    "Marin, Constan": "Robin Heckmann",
+    "Motejat, Vanes": "Tim Selle",
+    "Hustiuc, Mihai": "Tim Selle",
+    "Da Costa, Dani": "Robin Heckmann",
+    "Burke, Katarin": "Robin Heckmann",
+    "Martirosjan, D": "Tim Selle",
+    "Beeken, Martin": "Robin Heckmann",
+
+    "Roman": "Robin Heckmann",  # nur Vorname/Nachname - Kollisionsrisiko
+    "Lewandowski, HDI": "Robin Heckmann",  # Quelle unklar (kein Klartext-Treffer in den September-Dateien) - Key wie vom Nutzer gemeldet
+    "ACAR FAHRZEUGTE": "Robin Heckmann",  # abgeschnitten
+    "HASHEMI, SAID KABIR": "Tim Selle",  # Haftpflichtkasse
+    "IMMHOLD TREUHAN": "Tim Selle",  # abgeschnitten
+    "SIEGL VERWALTUN": "Tim Selle",  # abgeschnitten
+    "Gro~*Thomas": "Tim Selle",  # OCR-verzerrt, vermutlich "Groß*Thomas" (Deurag-Namensmuster)
+    "ABNOGNEVLISOSUTO": "Robin Heckmann",  # Haftpflichtkasse, Vertrag 54486580 - vom Nutzer identifiziert als Domenico Savio Angelo Bonvissuto; Name im PDF-Textlayer selbst verstuemmelt (kein OCR-Problem)
 }
 
 # Kennzeichen fuer nicht-kundenspezifische Sammelabzuege innerhalb einer
@@ -2181,6 +2271,23 @@ def load_betreuer_lookup(path):
                     companies[key] = bet
 
     return {"by_surname": by_surname, "people": people, "companies": companies}
+
+
+TRAILING_DATE_RE = re.compile(r"\s+\d{2}\.\d{2}\.(?:\d{2}|\d{4})$")
+
+
+def strip_trailing_date(kunde):
+    """Entfernt ein an einen (meist wegen Spaltenbreite abgeschnittenen)
+    Kundennamen angehaengtes Buchungsdatum, z.B. 'Lamitschka, Ph 01.09.26' ->
+    'Lamitschka, Ph' (siehe extract_generic_table() - betrifft v.a.
+    Concordia). Ohne das wuerde fuer denselben wiederkehrenden Kunden jeden
+    Monat ein neuer MANUAL_BETREUER_OVERRIDES_RAW-Eintrag mit dem jeweils
+    aktuellen Datum noetig sein, obwohl der (abgeschnittene) Name selbst
+    monatsunabhaengig stabil bleibt. Wird sowohl auf den extrahierten Namen
+    als auch beim Aufbau der Override-Lookup-Keys angewandt (apply_betreuer()),
+    damit alte UND neue Override-Eintraege unabhaengig davon greifen, ob ihr
+    Key das Datum noch enthaelt."""
+    return TRAILING_DATE_RE.sub("", str(kunde))
 
 
 def match_betreuer(kunde, lookup):
@@ -2836,11 +2943,15 @@ def apply_betreuer(df_rows, lookup):
         return df_rows
     df_rows = df_rows.copy()
 
-    overrides = {normalize_for_match(k): v for k, v in MANUAL_BETREUER_OVERRIDES_RAW.items()}
+    overrides = {
+        normalize_for_match(strip_trailing_date(k)): v
+        for k, v in MANUAL_BETREUER_OVERRIDES_RAW.items()
+    }
 
     def resolve(kunde):
-        override = overrides.get(normalize_for_match(kunde))
-        return override if override else match_betreuer(kunde, lookup)
+        kunde_stripped = strip_trailing_date(kunde)
+        override = overrides.get(normalize_for_match(kunde_stripped))
+        return override if override else match_betreuer(kunde_stripped, lookup)
 
     df_rows["Betreuer"] = df_rows["Kunde"].apply(resolve)
 
@@ -3247,6 +3358,26 @@ def build_summary_pdf(df_rows, out_target, month_label):
     pdf.output(out_target)
 
 
+def find_betreuer_path(base_dir):
+    """Liefert den Pfad zur aktuellen Betreuer.xlsx in base_dir. Bevorzugt
+    die exakte Datei 'Betreuer.xlsx', faellt aber auf die zuletzt
+    geaenderte Datei zurueck, die zu 'Betreuer*.xlsx' passt (z.B.
+    'Betreuer-12-10-2026.xlsx') - der CRM-Export wird manchmal mit
+    Datumsstempel im Dateinamen abgelegt statt die bestehende Datei zu
+    ueberschreiben (beobachtet 2026-10-12, main() fand dadurch tagelang
+    keine Betreuer.xlsx mehr und lief stillschweigend ohne Zuordnung
+    weiter). Gibt bei keinem Treffer trotzdem den (nicht existierenden)
+    Standardpfad zurueck - os.path.isfile() beim Aufrufer bleibt die
+    eigentliche Pruefung."""
+    exact = os.path.join(base_dir, "Betreuer.xlsx")
+    if os.path.isfile(exact):
+        return exact
+    candidates = glob.glob(os.path.join(base_dir, "Betreuer*.xlsx"))
+    if not candidates:
+        return exact
+    return max(candidates, key=os.path.getmtime)
+
+
 def main():
     if len(sys.argv) < 2:
         print("Aufruf: python courtage_extraktor.py <Monatsordner z.B. Juni-2026> [--pdf-uebersicht]")
@@ -3276,7 +3407,7 @@ def main():
 
     df_rows, df_control, df_agg, df_problem = process_files(files, month_folder, report_progress)
 
-    betreuer_path = os.path.join(BASE_DIR, "Betreuer.xlsx")
+    betreuer_path = find_betreuer_path(BASE_DIR)
     if os.path.isfile(betreuer_path):
         lookup = load_betreuer_lookup(betreuer_path)
         df_rows = apply_betreuer(df_rows, lookup)

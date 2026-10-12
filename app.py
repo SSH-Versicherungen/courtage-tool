@@ -40,6 +40,13 @@ try:
 except Exception:
     DEFAULT_BETREUER_PATH = ""
 DEFAULT_BETREUER_PATH = DEFAULT_BETREUER_PATH or os.environ.get("BETREUER_XLSX_PATH", "")
+if DEFAULT_BETREUER_PATH and not os.path.isfile(DEFAULT_BETREUER_PATH):
+    # Falls die konfigurierte Datei umbenannt/datumsgestempelt wurde (z.B.
+    # "Betreuer-12-10-2026.xlsx" statt "Betreuer.xlsx"), siehe
+    # find_betreuer_path() - sucht im selben Verzeichnis nach der zuletzt
+    # geaenderten "Betreuer*.xlsx" statt stillschweigend ohne Zuordnung
+    # weiterzulaufen.
+    DEFAULT_BETREUER_PATH = ce.find_betreuer_path(os.path.dirname(DEFAULT_BETREUER_PATH))
 DEFAULT_BETREUER_AVAILABLE = bool(DEFAULT_BETREUER_PATH) and os.path.isfile(DEFAULT_BETREUER_PATH)
 
 st.set_page_config(
