@@ -2142,6 +2142,11 @@ MANUAL_BETREUER_OVERRIDES_RAW = {
     "SIEGL VERWALTUN": "Tim Selle",  # abgeschnitten
     "Gro~*Thomas": "Tim Selle",  # OCR-verzerrt, vermutlich "Groß*Thomas" (Deurag-Namensmuster)
     "ABNOGNEVLISOSUTO": "Robin Heckmann",  # Haftpflichtkasse, Vertrag 54486580 - vom Nutzer identifiziert als Domenico Savio Angelo Bonvissuto; Name im PDF-Textlayer selbst verstuemmelt (kein OCR-Problem)
+    "Pension Wohligelegen": "Tim Selle",  # Alte-Leipziger, andere OCR-Schreibweise als bestehendes "Pension Wohlgelegen" (fehlendes "i")
+    "HeckmannxWilli": "Robin Heckmann",  # Signal-Iduna, andere OCR-Schreibweise als bestehendes "Heckmann*Willi" ("*" als "x" gelesen)
+    "Michaela u. Christine Seipp": "Robin Heckmann",  # Alte-Leipziger
+    "Seipp Michaela": "Robin Heckmann",
+    "Seipp Christine": "Robin Heckmann",
 }
 
 # Kennzeichen fuer nicht-kundenspezifische Sammelabzuege innerhalb einer
