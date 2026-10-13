@@ -158,6 +158,15 @@ uploaded_bank_files = st.file_uploader(
     type=["pdf"],
     accept_multiple_files=True,
 )
+uploaded_prior_result = None
+if uploaded_bank_files:
+    uploaded_prior_result = st.file_uploader(
+        "Ergebnis-Excel des Vormonats (optional) - die von diesem Tool erzeugte "
+        "Datei 'Kunde_Provision_<Vormonat>.xlsx'. Damit gelten Zahlungseingaenge, "
+        "die eine Abrechnung des Vormonats bezahlen, nicht als 'fehlende "
+        "Abrechnung' (Abrechnung und Zahlung liegen oft in verschiedenen Monaten).",
+        type=["xlsx"],
+    )
 
 betreuer_uploader_label = (
     "Betreuer.xlsx"
@@ -229,6 +238,8 @@ if process_clicked and uploaded_files:
             df_rows = ce.apply_betreuer(df_rows, betreuer_lookup)
 
         df_bank_unmatched = None
+        df_bank_explained = None
+        bank_read_errors = []
         if uploaded_bank_files:
             insurer_keys = pd.concat([
                 df_control["Versicherer"], df_agg["Versicherer"], df_problem["Versicherer"],
@@ -238,14 +249,29 @@ if process_clicked and uploaded_files:
                 bank_dest = os.path.join(tmp_dir, re.sub(r"[\\/]", "_", bf.name))
                 with open(bank_dest, "wb") as fh:
                     fh.write(bf.getbuffer())
-                all_credits.extend(ce.extract_bank_credits(bank_dest))
-            unmatched = ce.reconcile_bank_credits(all_credits, insurer_keys)
+                try:
+                    all_credits.extend(ce.extract_bank_credits(bank_dest))
+                except Exception as exc:
+                    bank_read_errors.append(f"{bf.name} ({type(exc).__name__})")
+            prior_totals = []
+            if uploaded_prior_result is not None:
+                try:
+                    prior_totals = ce.load_prior_month_totals(io.BytesIO(uploaded_prior_result.getbuffer()))
+                except Exception:
+                    bank_read_errors.append(f"{uploaded_prior_result.name} (Vormonats-Excel nicht lesbar)")
+            explained = []
+            unmatched = ce.reconcile_bank_credits(all_credits, insurer_keys, prior_totals, explained)
+            df_bank_explained = pd.DataFrame(
+                explained,
+                columns=["datum", "betrag", "sender", "verwendungszweck", "vorgang", "erklaert_durch"],
+            )
             df_bank_unmatched = pd.DataFrame(
                 unmatched, columns=["datum", "betrag", "sender", "verwendungszweck"]
             )
 
         out_buffer = io.BytesIO()
-        ce.write_excel(df_rows, df_control, df_agg, df_problem, out_buffer, df_bank_unmatched)
+        ce.write_excel(df_rows, df_control, df_agg, df_problem, out_buffer,
+                       df_bank_unmatched, df_bank_explained)
         out_buffer.seek(0)
 
         st.success(f"Fertig! {len(df_rows)} Buchungszeilen aus {len(saved_paths)} Dateien extrahiert.")
@@ -302,6 +328,16 @@ if process_clicked and uploaded_files:
                 )
                 st.dataframe(df_unmatched_betreuer, use_container_width=True)
 
+        if bank_read_errors:
+            st.warning(
+                "Folgende Datei(en) im Bankabgleich konnten nicht gelesen werden "
+                "und wurden uebersprungen: " + ", ".join(bank_read_errors)
+            )
+        if df_bank_explained is not None and not df_bank_explained.empty:
+            st.info(
+                f"{len(df_bank_explained)} Zahlungseingang/-eingaenge bezahlen eine "
+                "Abrechnung des Vormonats und gelten daher nicht als fehlend."
+            )
         if df_bank_unmatched is not None:
             st.subheader("Zahlungseingaenge ohne passende Abrechnung")
             if df_bank_unmatched.empty:
@@ -313,7 +349,11 @@ if process_clicked and uploaded_files:
                     "zugehoerige Abrechnungs-PDF - ggf. beim Versicherer nachfragen "
                     "oder pruefen, ob die PDF-Datei einfach nicht hochgeladen wurde. "
                     "Heuristischer Abgleich per Absendername/Verwendungszweck - "
-                    "bitte gegenpruefen, bevor Sie einen Versicherer kontaktieren."
+                    "bitte gegenpruefen, bevor Sie einen Versicherer kontaktieren. "
+                    "Ein Saldo-Vortrag oder Auszahlungsschwellen (z.B. Amex-Pool/"
+                    "Qualitypool) koennen dazu fuehren, dass Betrag und Zahlung "
+                    "nicht uebereinstimmen oder eine Zahlung ganz fehlt - das ist "
+                    "dann kein Fehler."
                 )
                 st.dataframe(df_bank_unmatched, use_container_width=True)
 
