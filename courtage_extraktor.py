@@ -990,6 +990,19 @@ def extract_arag(pdf):
             if not nums:
                 continue
             amt = parse_amount(nums[-1])
+            # Format je Zeile: "... Beitrag | Satz Provision Provision | MMJJ" -
+            # der Provisionsbetrag steht doppelt. Bei Fehllesung eines der
+            # beiden Werte (beobachtet: "4,52 44,52") entscheidet die Rechnung
+            # Beitrag x Satz, welcher der beiden stimmt.
+            if len(nums) >= 4:
+                base, rate = parse_amount(nums[-4]), parse_amount(nums[-3])
+                if base is not None and rate is not None and 0 < abs(rate) <= 100:
+                    expected = round(base * rate / 100.0, 2)
+                    candidates = [parse_amount(nums[-1]), parse_amount(nums[-2])]
+                    for cand in candidates:
+                        if cand is not None and abs(cand - expected) <= 0.011:
+                            amt = cand
+                            break
             if amt is None or abs(amt) > MAX_PLAUSIBLE_AMOUNT:
                 continue
 
@@ -2357,6 +2370,39 @@ def extract_helvetia(pdf):
     return all_rows, round(control_total, 2), all_ok
 
 
+ADCURI_ROW_RE = re.compile(
+    r"^(?P<name>[A-Za-zÀ-ÿ'.-]+(?: [A-Za-zÀ-ÿ'.-]+)*,\s*[A-Za-zÀ-ÿ'. -]+?)\s+\d{6,}\s+\S+\s+\d{2}\.\d{2}\.\d{2}\s+"
+    r"\S+\s+[\d.,]+\s+\d{1,3},\d{2}%\s+(?P<amt>-?[\d.]*\d,\d{2})\s+\d{6,}"
+)
+ADCURI_CONTROL_RE = re.compile(r"(?:Auszahl.:|Eingang:)\s*(-?[\d.]*\d,\d{2})")
+
+
+def extract_adcuri(pdf):
+    """Adcuri 'Provisionsabrechnung' (Textlayer): Zeilen 'Name, Vorname |
+    Versicherungsnummer | Sparte | Faelligkeit | Zahlweise | Berechnungs-
+    basis | Satz % | Verguetungsbetrag | Vermittlernummer'. Der generische
+    Parser hat die mehrzeilige Kopfzeile nicht erkannt und die Datei als
+    Sammelbeleg verworfen (Juli-2026: 8 Kunden, 106,52 EUR). Kontrolle:
+    aufgedruckte Auszahlung/Eingang. Rueckgabe: (rows, control)."""
+    rows, control = [], None
+    for pidx, page in enumerate(pdf.pages):
+        text = page.extract_text() or ""
+        for line in text.splitlines():
+            line = line.strip()
+            if control is None:
+                cm = ADCURI_CONTROL_RE.search(line)
+                if cm:
+                    control = parse_amount(cm.group(1))
+            m = ADCURI_ROW_RE.match(line)
+            if not m:
+                continue
+            amt = parse_amount(m.group("amt"))
+            if amt is None:
+                continue
+            rows.append((pidx, m.group("name").strip(), round(amt, 2), line, "text"))
+    return rows, control
+
+
 def find_total_in_text(full_text):
     """Sucht best-effort einen Gesamt-/Endbetrag im Freitext (fuer
     Sammelbelege ohne Kundendetail, zur Kontrolle)."""
@@ -2734,6 +2780,34 @@ MANUAL_BETREUER_OVERRIDES_RAW = {
     "AMNATRANSPORT": "Robin Heckmann",
     "SAS GABRI": "Robin Heckmann",
     "LUTEC GMBH": "Robin Heckmann",
+    # Juli-2026: aus der Excel des Nutzers (Monatsumsatz Juli, Zeile 479 ff.)
+    # per Betragsarithmetik hergeleitet - bis auf die genannten Kunden stimmte die
+    # Summe je Abrechnung exakt; Zuordnung bitte stichprobenartig gegenpruefen.
+    "BORN STAHLBAU G": "Tim Selle",  # Württembergische Juli: laut Excel TS
+    "AUTMATEC": "Robin Heckmann",  # Württembergische Juli: laut Excel RH
+    "LION ELECTRONIC": "Robin Heckmann",  # Württembergische Juli: laut Excel RH
+    "TURAN SOFRA 23": "Robin Heckmann",  # Württembergische Juli: laut Excel RH
+    "BORST & SCHNEID": "Tim Selle",  # Württembergische Juli: laut Excel TS
+    "HAMEDI PEGAH": "Tim Selle",  # Württembergische Juli: laut Excel TS
+    "SH-FENSTERSYSTE": "Tim Selle",  # Württembergische Juli: laut Excel TS
+    "Muhazmad F": "Tim Selle",  # Dialog Juli: komplette Liste (441,77) laut Excel TS
+    "Ali": "Tim Selle",  # Dialog Juli: komplette Liste laut Excel TS
+    "Bösinger": "Tim Selle",  # Dialog Juli: komplette Liste laut Excel TS
+    "S Innenausb": "Tim Selle",  # Dialog Juli: G & S Innenausbau, TS
+    "Alexander Stasiak 06.07.2026": "Tim Selle",  # Adam Riese Juli: laut Excel TS
+    "Hepting": "Robin Heckmann",  # Domcura Juli: laut Excel RH
+    "Gutperle / Czech / Sachse": "Andreas Selle",  # Domcura Juli: laut Excel AS
+    "Burke*William": "Robin Heckmann",  # Deurag Juli: laut Excel RH
+    "040.090.0501696.0 | Pavlovic,Anela": "Tim Selle",  # Helvetia Juli: laut Excel TS
+    "AGNUGTPEELORLE-": "Andreas Selle",  # Haftpflichtkasse Juli: laut Excel AS (verstuemmelter Name)
+    "Baumgärtner - Kessler, Automob": "Robin Heckmann",  # Mannheimer Juli: laut Excel RH
+    "Rudolf Wiedemann": "Robin Heckmann",  # Mannheimer Juli: laut Excel RH
+    "Theresa Hurtado Martinez": "Robin Heckmann",  # Hiscox Juli: laut Excel RH
+    "Turbo Team": "Robin Heckmann",  # ARAG Juli: laut Excel RH
+    "Wel]p‚ Simon": "Robin Heckmann",  # ARAG Juli: laut Excel RH (4,52)
+    "Gutperle-Böhringer, As": "Andreas Selle",  # ARAG Juli: laut Excel AS
+    "MB-Logistik-Weinheim G": "Tim Selle",  # ARAG Juli: laut Excel TS
+    "l\\‚ß-l;fogisiik-Wein heim G": "Tim Selle",  # ARAG Juli: MB-Logistik (verlesen), laut Excel TS
     # Helvetia September-2026, Vermittlerliste 00026/2026: Nutzer bestaetigt
     # Yasar/Aysar, Mehmet als TS-Kunden; die Liste (261,16 - 189,33 + 509,74 -
     # 331,33 = 250,24) ist in der Excel komplett TS gebucht, daher auch
@@ -3416,6 +3490,15 @@ def process_file(filepath, month_folder):
                           "insgesamt' verifiziert",
                 "rows": rows, "total_hint": target_total,
             }
+
+        if insurer_lower == "adcuri":
+            a_rows, a_control = extract_adcuri(pdf)
+            if a_rows and a_control is not None and abs(round(sum(r[2] for r in a_rows), 2) - a_control) <= 0.02:
+                return {
+                    "insurer": insurer, "file": filename, "status": "ok",
+                    "reason": "gegen aufgedruckte Auszahlung verifiziert",
+                    "rows": a_rows, "total_hint": a_control,
+                }
 
         if insurer_lower == "helvetia" and OCR_AVAILABLE:
             # Helvetia 'Vermittlerliste Komposit': eigener Pfad, siehe
