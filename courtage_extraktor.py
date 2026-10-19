@@ -2817,6 +2817,8 @@ MANUAL_BETREUER_OVERRIDES_RAW = {
     # Continentale Protokoll EUROPA-Reisekrankenversicherung: Buchungstext
     # "RV-200926540 SASSMANN-H" (2,40 EUR) - laut Nutzer RH-Kunde.
     "SASSMANN-H": "Robin Heckmann",
+    # Oktober-2026: im Lauf nicht zugeordnet (-83,02 EUR), laut Nutzer TS-Kunde.
+    "Kolasinac Asmir": "Tim Selle",
 }
 
 # Kennzeichen fuer nicht-kundenspezifische Sammelabzuege innerhalb einer
